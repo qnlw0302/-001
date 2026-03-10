@@ -10,13 +10,9 @@ document.querySelector("#app").innerHTML = `
     <header class="hero">
       <div>
         <p class="eyebrow">Inventory Management</p>
-        <h1>Product CRUD Dashboard</h1>
-        <p class="summary">
-          Create a product schema workflow and manage insert, get, update, delete, and list-all
-          operations from one page.
-        </p>
+        <h1>Product Dashboard</h1>
       </div>
-      <div class="threshold">Low stock threshold: 5</div>
+      <div class="threshold">Low stock limit: 5</div>
     </header>
 
     <section class="stats" id="stats">

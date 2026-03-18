@@ -1,175 +1,261 @@
 from __future__ import annotations
 
-import json
-import mimetypes
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import logging
+import os
+import sqlite3
 from pathlib import Path
-from urllib.parse import parse_qs, unquote, urlparse
+from typing import Any, Dict, Optional
 
-from crud import delete_product, get_product, init_db, insert_product, list_all_products, update_product
+from flask import Flask, current_app, g, jsonify, make_response, request, send_from_directory
+
+from crud import connect_db, delete_product, get_product, init_db, insert_product, list_products, update_product
 from schemas import ProductCreate, ProductUpdate
 
 
 BASE_DIR = Path(__file__).resolve().parent
 FRONTEND_DIR = BASE_DIR / "inventory-management-web"
-HOST = "127.0.0.1"
-PORT = 5000
+DEFAULT_DB_PATH = BASE_DIR / "inventory.db"
 
 
-class InventoryHandler(BaseHTTPRequestHandler):
-    server_version = "InventoryManagementHTTP/1.0"
+class ApiError(Exception):
+    def __init__(self, message: str, status_code: int = 400) -> None:
+        super().__init__(message)
+        self.message = message
+        self.status_code = status_code
 
-    def do_GET(self) -> None:
-        parsed = urlparse(self.path)
-        path = parsed.path
 
-        if path == "/api/products":
-            query = parse_qs(parsed.query)
-            search = query.get("search", [""])[0].strip()
-            products = [product.to_dict() for product in list_all_products(search)]
-            self.send_json(200, products)
-            return
-
-        if path.startswith("/api/products/"):
-            product_id = self.parse_product_id(path)
-            if product_id is None:
-                self.send_json(404, {"error": "Product not found."})
-                return
-
-            product = get_product(product_id)
-            if product is None:
-                self.send_json(404, {"error": "Product not found."})
-                return
-
-            self.send_json(200, product.to_dict())
-            return
-
-        if path == "/health":
-            self.send_json(200, {"status": "ok"})
-            return
-
-        self.serve_frontend(path)
-
-    def do_POST(self) -> None:
-        if self.path != "/api/products":
-            self.send_json(404, {"error": "Not found."})
-            return
-
-        try:
-            payload = self.read_json_body()
-            product = insert_product(ProductCreate.from_payload(payload))
-        except ValueError as error:
-            self.send_json(400, {"error": str(error)})
-            return
-        except json.JSONDecodeError:
-            self.send_json(400, {"error": "Request body must be valid JSON."})
-            return
-
-        self.send_json(201, product.to_dict())
-
-    def do_PUT(self) -> None:
-        parsed = urlparse(self.path)
-        product_id = self.parse_product_id(parsed.path)
-        if product_id is None:
-            self.send_json(404, {"error": "Product not found."})
-            return
-
-        try:
-            payload = self.read_json_body()
-            product = update_product(product_id, ProductUpdate.from_payload(payload))
-        except LookupError as error:
-            self.send_json(404, {"error": str(error)})
-            return
-        except ValueError as error:
-            self.send_json(400, {"error": str(error)})
-            return
-        except json.JSONDecodeError:
-            self.send_json(400, {"error": "Request body must be valid JSON."})
-            return
-
-        self.send_json(200, product.to_dict())
-
-    def do_DELETE(self) -> None:
-        parsed = urlparse(self.path)
-        product_id = self.parse_product_id(parsed.path)
-        if product_id is None:
-            self.send_json(404, {"error": "Product not found."})
-            return
-
-        deleted = delete_product(product_id)
-        if not deleted:
-            self.send_json(404, {"error": "Product not found."})
-            return
-
-        self.send_json(200, {"message": "Product deleted."})
-
-    def serve_frontend(self, request_path: str) -> None:
-        relative_path = request_path.lstrip("/") or "index.html"
-        safe_path = (FRONTEND_DIR / unquote(relative_path)).resolve()
-        frontend_root = FRONTEND_DIR.resolve()
-
-        try:
-            safe_path.relative_to(frontend_root)
-        except ValueError:
-            self.send_json(403, {"error": "Forbidden."})
-            return
-
-        if safe_path.is_dir():
-            safe_path = safe_path / "index.html"
-
-        if not safe_path.exists():
-            safe_path = frontend_root / "index.html"
-
-        if not safe_path.exists():
-            self.send_json(500, {"error": "Frontend files are missing."})
-            return
-
-        content_type, _ = mimetypes.guess_type(str(safe_path))
-        if content_type is None:
-            content_type = "application/octet-stream"
-
-        body = safe_path.read_bytes()
-        self.send_response(200)
-        self.send_header("Content-Type", f"{content_type}; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def read_json_body(self) -> dict[str, object]:
-        content_length = int(self.headers.get("Content-Length", "0"))
-        raw_body = self.rfile.read(content_length) if content_length > 0 else b"{}"
-        payload = json.loads(raw_body.decode("utf-8"))
-        if not isinstance(payload, dict):
-            raise ValueError("Request body must be a JSON object.")
-        return payload
-
-    def parse_product_id(self, path: str) -> int | None:
-        parts = [part for part in path.split("/") if part]
-        if len(parts) != 3 or parts[0] != "api" or parts[1] != "products":
-            return None
-        try:
-            return int(parts[2])
-        except ValueError:
-            return None
-
-    def send_json(self, status: int, payload: dict[str, object] | list[dict[str, object]]) -> None:
-        body = json.dumps(payload).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def log_message(self, format: str, *args) -> None:
+def load_env_file(env_path: Path) -> None:
+    if not env_path.exists():
         return
 
+    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        os.environ.setdefault(key.strip(), value.strip())
 
-def run() -> None:
-    init_db()
-    server = ThreadingHTTPServer((HOST, PORT), InventoryHandler)
-    print(f"Inventory backend running at http://{HOST}:{PORT}")
-    server.serve_forever()
+
+load_env_file(BASE_DIR / ".env")
+
+
+def create_app(test_config: Optional[Dict[str, Any]] = None) -> Flask:
+    app = Flask(__name__, static_folder=None)
+    app.config.update(
+        HOST=os.getenv("INVENTORY_HOST", "127.0.0.1"),
+        PORT=int(os.getenv("INVENTORY_PORT", "5000")),
+        DB_PATH=os.getenv("INVENTORY_DB_PATH", str(DEFAULT_DB_PATH)),
+        API_KEY=os.getenv("INVENTORY_API_KEY", "dev-inventory-key"),
+        CORS_ORIGIN=os.getenv("INVENTORY_CORS_ORIGIN", "http://127.0.0.1:5173"),
+        LOG_LEVEL=os.getenv("INVENTORY_LOG_LEVEL", "INFO"),
+        FRONTEND_DIR=str(FRONTEND_DIR),
+        JSON_SORT_KEYS=False,
+    )
+    if test_config:
+        app.config.update(test_config)
+
+    configure_logging(app)
+    initialize_database(app.config["DB_PATH"])
+    register_lifecycle_hooks(app)
+    register_error_handlers(app)
+    register_routes(app)
+    return app
+
+
+def configure_logging(app: Flask) -> None:
+    level_name = str(app.config.get("LOG_LEVEL", "INFO")).upper()
+    level = getattr(logging, level_name, logging.INFO)
+    if not logging.getLogger().handlers:
+        logging.basicConfig(
+            level=level,
+            format="%(asctime)s %(levelname)s %(name)s %(message)s",
+        )
+    app.logger.setLevel(level)
+
+
+def initialize_database(db_path: str) -> None:
+    connection = connect_db(db_path)
+    try:
+        init_db(connection)
+    finally:
+        connection.close()
+
+
+def register_lifecycle_hooks(app: Flask) -> None:
+    @app.before_request
+    def before_request() -> Optional[Any]:
+        if request.path.startswith("/api/"):
+            current_app.logger.info("%s %s", request.method, request.full_path.rstrip("?"))
+
+        if request.method == "OPTIONS" and request.path.startswith("/api/"):
+            return make_response("", 204)
+
+        if request.path.startswith("/api/") and request.method in ("POST", "PUT", "DELETE"):
+            expected_key = current_app.config["API_KEY"]
+            provided_key = request.headers.get("X-API-Key", "")
+            if provided_key != expected_key:
+                raise ApiError("Missing or invalid API key.", 401)
+        return None
+
+    @app.after_request
+    def after_request(response):
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Referrer-Policy"] = "same-origin"
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'self'; "
+            "script-src 'self'; "
+            "style-src 'self'; "
+            "img-src 'self' data:; "
+            "object-src 'none'; "
+            "base-uri 'self'; "
+            "frame-ancestors 'none'"
+        )
+
+        if request.path.startswith("/api/"):
+            allowed_origin = current_app.config["CORS_ORIGIN"]
+            request_origin = request.headers.get("Origin")
+            if allowed_origin == "*":
+                response.headers["Access-Control-Allow-Origin"] = "*"
+            elif request_origin == allowed_origin:
+                response.headers["Access-Control-Allow-Origin"] = allowed_origin
+                response.headers["Vary"] = "Origin"
+
+            response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
+            response.headers["Access-Control-Allow-Headers"] = "Content-Type, X-API-Key"
+
+        return response
+
+    @app.teardown_appcontext
+    def teardown_db(_error: Optional[BaseException]) -> None:
+        connection = g.pop("db", None)
+        if connection is not None:
+            connection.close()
+
+
+def register_error_handlers(app: Flask) -> None:
+    @app.errorhandler(ApiError)
+    def handle_api_error(error: ApiError):
+        return jsonify({"error": error.message}), error.status_code
+
+    @app.errorhandler(ValueError)
+    def handle_value_error(error: ValueError):
+        status_code = 400 if is_api_request() else 500
+        current_app.logger.warning("Value error: %s", error)
+        return jsonify({"error": str(error)}), status_code
+
+    @app.errorhandler(LookupError)
+    def handle_lookup_error(error: LookupError):
+        current_app.logger.info("Lookup error: %s", error)
+        return jsonify({"error": str(error)}), 404
+
+    @app.errorhandler(sqlite3.Error)
+    def handle_sqlite_error(error: sqlite3.Error):
+        current_app.logger.exception("Database error: %s", error)
+        return jsonify({"error": "Database operation failed."}), 500
+
+    @app.errorhandler(Exception)
+    def handle_unexpected_error(error: Exception):
+        current_app.logger.exception("Unexpected error: %s", error)
+        if is_api_request():
+            return jsonify({"error": "Unexpected server error."}), 500
+        return jsonify({"error": "Unexpected server error."}), 500
+
+
+def register_routes(app: Flask) -> None:
+    @app.route("/health", methods=["GET"])
+    def health() -> Any:
+        return jsonify({"status": "ok"})
+
+    @app.route("/api/products", methods=["GET"])
+    def api_list_products() -> Any:
+        search = request.args.get("search", "").strip()
+        page = parse_positive_int(request.args.get("page", "1"), "page")
+        limit = parse_positive_int(request.args.get("limit", "10"), "limit")
+        payload = list_products(get_db(), search=search, page=page, limit=limit)
+        return jsonify(payload)
+
+    @app.route("/api/products/<int:product_id>", methods=["GET"])
+    def api_get_product(product_id: int) -> Any:
+        product = get_product(get_db(), product_id)
+        if product is None:
+            raise LookupError("Product not found.")
+        return jsonify(product.to_dict())
+
+    @app.route("/api/products", methods=["POST"])
+    def api_insert_product() -> Any:
+        payload = read_json_body()
+        product = insert_product(get_db(), ProductCreate.from_payload(payload))
+        return jsonify(product.to_dict()), 201
+
+    @app.route("/api/products/<int:product_id>", methods=["PUT"])
+    def api_update_product(product_id: int) -> Any:
+        payload = read_json_body()
+        product = update_product(get_db(), product_id, ProductUpdate.from_payload(payload))
+        return jsonify(product.to_dict())
+
+    @app.route("/api/products/<int:product_id>", methods=["DELETE"])
+    def api_delete_product(product_id: int) -> Any:
+        deleted = delete_product(get_db(), product_id)
+        if not deleted:
+            raise LookupError("Product not found.")
+        return jsonify({"message": "Product deleted."})
+
+    @app.route("/", defaults={"path": ""})
+    @app.route("/<path:path>")
+    def serve_frontend(path: str) -> Any:
+        if path.startswith("api/"):
+            raise ApiError("Not found.", 404)
+
+        frontend_root = Path(current_app.config["FRONTEND_DIR"]).resolve()
+        requested_path = (frontend_root / path).resolve() if path else frontend_root / "index.html"
+        try:
+            requested_path.relative_to(frontend_root)
+        except ValueError:
+            raise ApiError("Forbidden.", 403)
+
+        if requested_path.is_dir():
+            requested_path = requested_path / "index.html"
+
+        if requested_path.exists():
+            relative_path = requested_path.relative_to(frontend_root)
+            return send_from_directory(str(frontend_root), str(relative_path))
+        return send_from_directory(str(frontend_root), "index.html")
+
+
+def get_db() -> sqlite3.Connection:
+    if "db" not in g:
+        g.db = connect_db(current_app.config["DB_PATH"])
+    return g.db
+
+
+def parse_positive_int(raw_value: str, field_name: str) -> int:
+    try:
+        value = int(raw_value)
+    except (TypeError, ValueError):
+        raise ApiError("%s must be an integer." % field_name, 400)
+    if value <= 0:
+        raise ApiError("%s must be greater than 0." % field_name, 400)
+    return value
+
+
+def read_json_body() -> Dict[str, Any]:
+    payload = request.get_json(silent=True)
+    if payload is None:
+        raise ApiError("Request body must be valid JSON.", 400)
+    if not isinstance(payload, dict):
+        raise ApiError("Request body must be a JSON object.", 400)
+    return payload
+
+
+def is_api_request() -> bool:
+    return request.path.startswith("/api/")
 
 
 if __name__ == "__main__":
-    run()
+    app = create_app()
+    app.run(
+        host=app.config["HOST"],
+        port=app.config["PORT"],
+        debug=False,
+    )

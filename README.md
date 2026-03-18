@@ -1,16 +1,17 @@
 # Inventory Management
 
-This project is a simple inventory management web application with a Python backend and a Vite-style frontend.
+This project is a small inventory management application with a Flask backend and a Vite-style frontend.
 
-## Features
+## What changed
 
-- Create a `Product` schema
-- Insert product
-- Get product
-- Update product
-- Delete product
-- List all products
-- Low stock warning with a fixed threshold of `5`
+- Backend moved from `http.server` to Flask
+- API key protection added for create, update, and delete requests
+- CORS and security headers added
+- Environment-variable-based configuration added
+- Logging enabled
+- Product list now supports pagination
+- Low stock logic is now fixed at a restock alert when stock is below `5`
+- API tests added with Flask test client
 
 ## Project Structure
 
@@ -19,7 +20,12 @@ inventory-management/
   main.py
   crud.py
   schemas.py
-  inventory.db
+  requirements.txt
+  .env.example
+  README.md
+  API_REFERENCE.md
+  tests/
+    test_api.py
   inventory-management-web/
     index.html
     package.json
@@ -31,65 +37,59 @@ inventory-management/
 
 ## Product Schema
 
-The backend uses three schema classes defined in `schemas.py`:
+The backend uses the following schema objects in `schemas.py`:
 
-- `Product`: complete product object returned by the backend
-- `ProductCreate`: payload schema for creating a product
-- `ProductUpdate`: payload schema for updating a product
+- `Product`
+- `ProductCreate`
+- `ProductUpdate`
 
-Schema fields:
+Fields:
 
-- `id`: integer
-- `sku`: string, required, max length `64`
-- `name`: string, required, max length `200`
-- `stock_qty`: integer, must be `>= 0`
-- `low_stock_threshold`: fixed to `5`
-- `status`: computed field, one of `ok`, `low`, `out`
+- `id`
+- `sku`
+- `name`
+- `stock_qty`
+- `status`
+- `needs_restock`
+- `restock_threshold`
 
 Status rules:
 
-- `out`: `stock_qty <= 0`
-- `low`: `stock_qty <= 5`
-- `ok`: `stock_qty > 5`
+- `out`: stock is `0`
+- `low`: stock is between `1` and `4`
+- `ok`: stock is `5` or above
 
 ## Backend
 
-The backend is implemented in `main.py`. It uses:
-
-- `http.server` for HTTP handling
-- `sqlite3` for database storage
-- `crud.py` for data access
-- `schemas.py` for schema validation
-
-### Run the backend
+Install dependencies:
 
 ```bash
-python3 main.py
+pip install -r requirements.txt
 ```
 
-After the server starts, open:
+Copy environment settings:
+
+```bash
+cp .env.example .env
+```
+
+Run the backend:
+
+```bash
+python main.py
+```
+
+Open:
 
 ```text
 http://127.0.0.1:5000
 ```
 
-The backend also serves the frontend files from `inventory-management-web/`.
-
 ## Frontend
 
-The frontend lives in `inventory-management-web/` and follows a Vite project structure.
+The frontend is in `inventory-management-web/`.
 
-### Files
-
-- `index.html`: app entry
-- `src/main.js`: UI logic and API calls
-- `src/style.css`: page styles
-- `package.json`: Vite scripts
-- `vite.config.js`: local dev proxy config
-
-### Run with Vite
-
-This requires Node.js and npm to be installed first.
+Run the Vite frontend:
 
 ```bash
 cd inventory-management-web
@@ -97,41 +97,20 @@ npm install
 npm run dev
 ```
 
-Default Vite dev URL:
+Vite proxies `/api` requests to the Flask backend on port `5000`.
 
-```text
-http://127.0.0.1:5173
+## API Notes
+
+- `GET` endpoints do not require an API key
+- `POST`, `PUT`, and `DELETE` require `X-API-Key`
+- Product list supports `page`, `limit`, and `search`
+
+Full endpoint details are in `API_REFERENCE.md`.
+
+## Tests
+
+Run tests with:
+
+```bash
+python -m unittest discover -s tests
 ```
-
-The Vite config proxies `/api` requests to the Python backend at `http://127.0.0.1:5000`.
-
-## API Summary
-
-The API is documented in `API_REFERENCE.md`.
-
-Main endpoints:
-
-- `GET /health`
-- `GET /api/products`
-- `GET /api/products/{id}`
-- `POST /api/products`
-- `PUT /api/products/{id}`
-- `DELETE /api/products/{id}`
-
-## Database
-
-Data is stored in `inventory.db` using a single `products` table.
-
-Table fields:
-
-- `id`
-- `sku`
-- `name`
-- `stock_qty`
-- `low_stock_threshold`
-
-## Notes
-
-- The low stock threshold is always `5`.
-- The backend can run without any third-party Python package.
-- The frontend uses plain JavaScript with a Vite-compatible structure.

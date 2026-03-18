@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Mapping
+from typing import Any, Dict, Mapping, Optional
 
 
 LOW_STOCK_THRESHOLD = 5
@@ -18,7 +18,7 @@ def _read_required_text(payload: Mapping[str, Any], key: str, label: str, max_le
     return text
 
 
-def _read_optional_text(payload: Mapping[str, Any], key: str, label: str, max_length: int) -> str | None:
+def _read_optional_text(payload: Mapping[str, Any], key: str, label: str, max_length: int) -> Optional[str]:
     if key not in payload:
         return None
 
@@ -45,7 +45,7 @@ def _read_required_int(payload: Mapping[str, Any], key: str, label: str) -> int:
     return value
 
 
-def _read_optional_int(payload: Mapping[str, Any], key: str, label: str) -> int | None:
+def _read_optional_int(payload: Mapping[str, Any], key: str, label: str) -> Optional[int]:
     if key not in payload:
         return None
 
@@ -69,24 +69,28 @@ class Product:
     sku: str
     name: str
     stock_qty: int
-    low_stock_threshold: int = LOW_STOCK_THRESHOLD
 
     @property
     def status(self) -> str:
         if self.stock_qty <= 0:
             return "out"
-        if self.stock_qty <= self.low_stock_threshold:
+        if self.stock_qty < LOW_STOCK_THRESHOLD:
             return "low"
         return "ok"
 
-    def to_dict(self) -> dict[str, Any]:
+    @property
+    def needs_restock(self) -> bool:
+        return 0 < self.stock_qty < LOW_STOCK_THRESHOLD
+
+    def to_dict(self) -> Dict[str, Any]:
         return {
             "id": self.id,
             "sku": self.sku,
             "name": self.name,
             "stock_qty": self.stock_qty,
-            "low_stock_threshold": self.low_stock_threshold,
             "status": self.status,
+            "needs_restock": self.needs_restock,
+            "restock_threshold": LOW_STOCK_THRESHOLD,
         }
 
 
@@ -95,7 +99,6 @@ class ProductCreate:
     sku: str
     name: str
     stock_qty: int = 0
-    low_stock_threshold: int = LOW_STOCK_THRESHOLD
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, Any]) -> "ProductCreate":
@@ -103,15 +106,14 @@ class ProductCreate:
             sku=_read_required_text(payload, "sku", "SKU", 64),
             name=_read_required_text(payload, "name", "Product name", 200),
             stock_qty=_read_required_int(payload, "stock_qty", "Stock quantity"),
-            low_stock_threshold=LOW_STOCK_THRESHOLD,
         )
 
 
 @dataclass
 class ProductUpdate:
-    sku: str | None = None
-    name: str | None = None
-    stock_qty: int | None = None
+    sku: Optional[str] = None
+    name: Optional[str] = None
+    stock_qty: Optional[int] = None
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, Any]) -> "ProductUpdate":

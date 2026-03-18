@@ -110,13 +110,33 @@ input {
 }
 
 .toolbar {
-  display: flex;
+  display: grid;
   gap: 12px;
   margin-bottom: 18px;
 }
 
-.toolbar input {
+.toolbar-main,
+.toolbar-auth {
+  display: flex;
+  gap: 12px;
+}
+
+.toolbar-main input,
+.toolbar-auth input {
   flex: 1;
+}
+
+.toolbar-note {
+  margin: 0;
+  color: var(--muted);
+  font-size: 14px;
+}
+
+.toolbar-note code {
+  padding: 2px 6px;
+  border-radius: 8px;
+  background: var(--surface-alt);
+  border: 1px solid var(--line);
 }
 
 .content {
@@ -168,10 +188,12 @@ input:focus {
 }
 
 .actions,
-.get-row {
+.get-row,
+.pagination {
   display: flex;
   gap: 10px;
   flex-wrap: wrap;
+  align-items: center;
 }
 
 .button {
@@ -257,6 +279,11 @@ input:focus {
   letter-spacing: -0.02em;
 }
 
+.detail-note {
+  margin: 16px 0 0;
+  color: var(--muted);
+}
+
 .empty-state,
 .empty-table {
   display: grid;
@@ -296,7 +323,7 @@ tbody tr:last-child td {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  min-width: 90px;
+  min-width: 100px;
   padding: 6px 10px;
   border-radius: 999px;
   font-size: 13px;
@@ -336,11 +363,24 @@ tbody tr:last-child td {
   color: var(--danger);
 }
 
+.pagination {
+  margin-top: 18px;
+  justify-content: space-between;
+}
+
+.pagination-label {
+  color: var(--muted);
+}
+
 @media (max-width: 920px) {
   .hero,
-  .toolbar,
   .content {
     grid-template-columns: 1fr;
+    flex-direction: column;
+  }
+
+  .toolbar-main,
+  .toolbar-auth {
     flex-direction: column;
   }
 
@@ -352,6 +392,10 @@ tbody tr:last-child td {
 @media (max-width: 720px) {
   .detail-grid {
     grid-template-columns: 1fr;
+  }
+
+  .pagination {
+    justify-content: flex-start;
   }
 
   th:first-child,

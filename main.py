@@ -3,13 +3,32 @@ from __future__ import annotations
 import logging
 import os
 import sqlite3
+from datetime import timedelta
 from pathlib import Path
 from typing import Any, Dict, Optional
 
 from flask import Flask, current_app, g, jsonify, make_response, request, send_from_directory
 
-from crud import connect_db, delete_product, get_product, init_db, insert_product, list_products, update_product
-from schemas import ProductCreate, ProductUpdate
+from auth import (
+    current_user,
+    ensure_seed_admin,
+    login_required,
+    login_user,
+    logout_user,
+    verify_current_password,
+    verify_password,
+)
+from crud import (
+    connect_db,
+    delete_product,
+    get_product,
+    get_user_by_username,
+    init_db,
+    insert_product,
+    list_products,
+    update_product,
+)
+from schemas import DeleteConfirmation, LoginRequest, ProductCreate, ProductUpdate
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -45,17 +64,24 @@ def create_app(test_config: Optional[Dict[str, Any]] = None) -> Flask:
         HOST=os.getenv("INVENTORY_HOST", "127.0.0.1"),
         PORT=int(os.getenv("INVENTORY_PORT", "5000")),
         DB_PATH=os.getenv("INVENTORY_DB_PATH", str(DEFAULT_DB_PATH)),
-        API_KEY=os.getenv("INVENTORY_API_KEY", "dev-inventory-key"),
+        SECRET_KEY=os.getenv("INVENTORY_SECRET_KEY", "dev-secret-change-me"),
         CORS_ORIGIN=os.getenv("INVENTORY_CORS_ORIGIN", "http://127.0.0.1:5173"),
         LOG_LEVEL=os.getenv("INVENTORY_LOG_LEVEL", "INFO"),
+        ADMIN_USERNAME=os.getenv("INVENTORY_ADMIN_USERNAME", "admin"),
+        ADMIN_PASSWORD=os.getenv("INVENTORY_ADMIN_PASSWORD", "admin123"),
         FRONTEND_DIR=str(FRONTEND_DIR),
         JSON_SORT_KEYS=False,
+        PERMANENT_SESSION_LIFETIME=timedelta(days=30),
+        SESSION_COOKIE_HTTPONLY=True,
+        SESSION_COOKIE_SAMESITE="Lax",
+        SESSION_COOKIE_SECURE=os.getenv("INVENTORY_SESSION_SECURE", "0") == "1",
+        SESSION_COOKIE_NAME="inventory_session",
     )
     if test_config:
         app.config.update(test_config)
 
     configure_logging(app)
-    initialize_database(app.config["DB_PATH"])
+    initialize_database(app)
     register_lifecycle_hooks(app)
     register_error_handlers(app)
     register_routes(app)
@@ -73,10 +99,16 @@ def configure_logging(app: Flask) -> None:
     app.logger.setLevel(level)
 
 
-def initialize_database(db_path: str) -> None:
-    connection = connect_db(db_path)
+def initialize_database(app: Flask) -> None:
+    connection = connect_db(app.config["DB_PATH"])
     try:
         init_db(connection)
+        with app.app_context():
+            ensure_seed_admin(
+                connection,
+                app.config["ADMIN_USERNAME"],
+                app.config["ADMIN_PASSWORD"],
+            )
     finally:
         connection.close()
 
@@ -89,12 +121,6 @@ def register_lifecycle_hooks(app: Flask) -> None:
 
         if request.method == "OPTIONS" and request.path.startswith("/api/"):
             return make_response("", 204)
-
-        if request.path.startswith("/api/") and request.method in ("POST", "PUT", "DELETE"):
-            expected_key = current_app.config["API_KEY"]
-            provided_key = request.headers.get("X-API-Key", "")
-            if provided_key != expected_key:
-                raise ApiError("Missing or invalid API key.", 401)
         return None
 
     @app.after_request
@@ -120,9 +146,10 @@ def register_lifecycle_hooks(app: Flask) -> None:
             elif request_origin == allowed_origin:
                 response.headers["Access-Control-Allow-Origin"] = allowed_origin
                 response.headers["Vary"] = "Origin"
+                response.headers["Access-Control-Allow-Credentials"] = "true"
 
             response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
-            response.headers["Access-Control-Allow-Headers"] = "Content-Type, X-API-Key"
+            response.headers["Access-Control-Allow-Headers"] = "Content-Type"
 
         return response
 
@@ -157,8 +184,6 @@ def register_error_handlers(app: Flask) -> None:
     @app.errorhandler(Exception)
     def handle_unexpected_error(error: Exception):
         current_app.logger.exception("Unexpected error: %s", error)
-        if is_api_request():
-            return jsonify({"error": "Unexpected server error."}), 500
         return jsonify({"error": "Unexpected server error."}), 500
 
 
@@ -166,6 +191,28 @@ def register_routes(app: Flask) -> None:
     @app.route("/health", methods=["GET"])
     def health() -> Any:
         return jsonify({"status": "ok"})
+
+    @app.route("/api/auth/login", methods=["POST"])
+    def api_login() -> Any:
+        payload = read_json_body()
+        credentials = LoginRequest.from_payload(payload)
+        record = get_user_by_username(get_db(), credentials.username)
+        if record is None or not verify_password(record["password_hash"], credentials.password):
+            raise ApiError("Invalid username or password.", 401)
+        login_user(record["id"], credentials.remember)
+        return jsonify({"user": {"id": record["id"], "username": record["username"]}})
+
+    @app.route("/api/auth/logout", methods=["POST"])
+    def api_logout() -> Any:
+        logout_user()
+        return jsonify({"message": "Logged out."})
+
+    @app.route("/api/auth/me", methods=["GET"])
+    def api_me() -> Any:
+        user = current_user(get_db())
+        if user is None:
+            return jsonify({"user": None}), 401
+        return jsonify({"user": user.to_dict()})
 
     @app.route("/api/products", methods=["GET"])
     def api_list_products() -> Any:
@@ -183,19 +230,26 @@ def register_routes(app: Flask) -> None:
         return jsonify(product.to_dict())
 
     @app.route("/api/products", methods=["POST"])
+    @login_required
     def api_insert_product() -> Any:
         payload = read_json_body()
         product = insert_product(get_db(), ProductCreate.from_payload(payload))
         return jsonify(product.to_dict()), 201
 
     @app.route("/api/products/<int:product_id>", methods=["PUT"])
+    @login_required
     def api_update_product(product_id: int) -> Any:
         payload = read_json_body()
         product = update_product(get_db(), product_id, ProductUpdate.from_payload(payload))
         return jsonify(product.to_dict())
 
     @app.route("/api/products/<int:product_id>", methods=["DELETE"])
+    @login_required
     def api_delete_product(product_id: int) -> Any:
+        payload = read_json_body()
+        confirmation = DeleteConfirmation.from_payload(payload)
+        if not verify_current_password(get_db(), confirmation.password):
+            raise ApiError("Password does not match.", 403)
         deleted = delete_product(get_db(), product_id)
         if not deleted:
             raise LookupError("Product not found.")

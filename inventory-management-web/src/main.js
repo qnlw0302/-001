@@ -68,6 +68,8 @@ async function request(path, options = {}) {
   return data;
 }
 
+/* ----- Login ----- */
+
 function renderLoginView() {
   const savedUsername = window.localStorage.getItem("inventoryUsername") || "";
   const savedRemember = window.localStorage.getItem("inventoryRemember") === "1";
@@ -106,27 +108,18 @@ function renderLoginView() {
           <div class="actions">
             <button id="loginButton" class="button primary" type="submit">Log In</button>
           </div>
+
+          <p class="auth-switch">No account yet? <button id="goRegisterButton" class="link-button" type="button">Create one</button></p>
         </form>
       </section>
     </main>
   `;
 
-  document.querySelector("#togglePasswordButton").addEventListener("click", togglePasswordVisibility);
+  document.querySelector("#togglePasswordButton").addEventListener("click", () =>
+    togglePasswordVisibility("#loginPassword", "#togglePasswordButton")
+  );
   document.querySelector("#loginForm").addEventListener("submit", handleLoginSubmit);
-}
-
-function togglePasswordVisibility() {
-  const input = document.querySelector("#loginPassword");
-  const button = document.querySelector("#togglePasswordButton");
-  if (input.type === "password") {
-    input.type = "text";
-    button.textContent = "Hide";
-    button.setAttribute("aria-label", "Hide password");
-  } else {
-    input.type = "password";
-    button.textContent = "Show";
-    button.setAttribute("aria-label", "Show password");
-  }
+  document.querySelector("#goRegisterButton").addEventListener("click", renderRegisterView);
 }
 
 async function handleLoginSubmit(event) {
@@ -147,19 +140,127 @@ async function handleLoginSubmit(event) {
       body: JSON.stringify({ username, password, remember })
     });
     state.user = payload.user;
-    if (remember) {
-      window.localStorage.setItem("inventoryUsername", username);
-      window.localStorage.setItem("inventoryRemember", "1");
-    } else {
-      window.localStorage.removeItem("inventoryUsername");
-      window.localStorage.removeItem("inventoryRemember");
-    }
+    persistRememberedUsername(username, remember);
     renderInventoryView();
     await loadProducts(1);
   } catch (error) {
     showMessage(loginMessage, error.message, "error");
   }
 }
+
+/* ----- Register ----- */
+
+function renderRegisterView() {
+  appRoot.innerHTML = `
+    <main class="auth-page">
+      <section class="auth-card">
+        <header class="auth-heading">
+          <h1>Create Account</h1>
+          <p>Pick a username and password to start managing your inventory.</p>
+        </header>
+
+        <div id="registerMessage" class="message"></div>
+
+        <form id="registerForm" class="stack" autocomplete="on">
+          <label class="field">
+            <span>Username <em class="field-hint">(3-64 chars, no spaces)</em></span>
+            <input id="registerUsername" name="username" type="text" autocomplete="username" maxlength="64" required>
+          </label>
+
+          <label class="field">
+            <span>Password <em class="field-hint">(min 6 chars)</em></span>
+            <div class="password-row">
+              <input id="registerPassword" name="password" type="password" autocomplete="new-password" minlength="6" maxlength="128" required>
+              <button id="toggleRegisterPasswordButton" class="button ghost" type="button" aria-label="Show password">Show</button>
+            </div>
+          </label>
+
+          <label class="field">
+            <span>Confirm Password</span>
+            <input id="registerPasswordConfirm" type="password" autocomplete="new-password" minlength="6" maxlength="128" required>
+          </label>
+
+          <div class="auth-options">
+            <label class="checkbox">
+              <input id="registerRemember" type="checkbox">
+              <span>Remember me</span>
+            </label>
+          </div>
+
+          <div class="actions">
+            <button class="button primary" type="submit">Create Account</button>
+          </div>
+
+          <p class="auth-switch">Already have an account? <button id="goLoginButton" class="link-button" type="button">Sign in</button></p>
+        </form>
+      </section>
+    </main>
+  `;
+
+  document.querySelector("#toggleRegisterPasswordButton").addEventListener("click", () =>
+    togglePasswordVisibility("#registerPassword", "#toggleRegisterPasswordButton")
+  );
+  document.querySelector("#registerForm").addEventListener("submit", handleRegisterSubmit);
+  document.querySelector("#goLoginButton").addEventListener("click", renderLoginView);
+}
+
+async function handleRegisterSubmit(event) {
+  event.preventDefault();
+  const registerMessage = document.querySelector("#registerMessage");
+  const username = document.querySelector("#registerUsername").value.trim();
+  const password = document.querySelector("#registerPassword").value;
+  const confirm = document.querySelector("#registerPasswordConfirm").value;
+  const remember = document.querySelector("#registerRemember").checked;
+
+  if (!username || !password) {
+    showMessage(registerMessage, "Enter username and password.", "error");
+    return;
+  }
+  if (password !== confirm) {
+    showMessage(registerMessage, "Passwords do not match.", "error");
+    return;
+  }
+
+  try {
+    const payload = await request("/api/auth/register", {
+      method: "POST",
+      body: JSON.stringify({ username, password, remember })
+    });
+    state.user = payload.user;
+    persistRememberedUsername(username, remember);
+    renderInventoryView();
+    await loadProducts(1);
+  } catch (error) {
+    showMessage(registerMessage, error.message, "error");
+  }
+}
+
+function persistRememberedUsername(username, remember) {
+  if (remember) {
+    window.localStorage.setItem("inventoryUsername", username);
+    window.localStorage.setItem("inventoryRemember", "1");
+  } else {
+    window.localStorage.removeItem("inventoryUsername");
+    window.localStorage.removeItem("inventoryRemember");
+  }
+}
+
+function togglePasswordVisibility(inputSelector, buttonSelector) {
+  const input = document.querySelector(inputSelector);
+  const button = document.querySelector(buttonSelector);
+  if (!input || !button) return;
+  if (input.type === "password") {
+    input.type = "text";
+    button.textContent = "Hide";
+    button.setAttribute("aria-label", "Hide password");
+  } else {
+    input.type = "password";
+    button.textContent = "Show";
+    button.setAttribute("aria-label", "Show password");
+  }
+}
+
+/* ----- Inventory ----- */
 
 function renderInventoryView() {
   appRoot.innerHTML = `
@@ -170,7 +271,9 @@ function renderInventoryView() {
         </div>
         <div class="hero-meta">
           <span class="threshold" id="defaultThresholdBadge">Default restock alert: below ${state.defaultThreshold}</span>
-          <span class="user-badge">Signed in as <strong>${escapeHtml(state.user.username)}</strong></span>
+          <span class="user-badge">Signed in as <strong id="currentUsernameLabel">${escapeHtml(state.user.username)}</strong></span>
+          <button id="editProfileButton" class="button ghost" type="button">Edit Profile</button>
+          <button id="changePasswordButton" class="button ghost" type="button">Change Password</button>
           <button id="logoutButton" class="button ghost" type="button">Log Out</button>
         </div>
       </header>
@@ -296,6 +399,54 @@ function renderInventoryView() {
         </form>
       </div>
     </div>
+
+    <div id="profileOverlay" class="modal-overlay" hidden>
+      <div class="modal-card" role="dialog" aria-labelledby="profileTitle">
+        <h2 id="profileTitle">Edit Profile</h2>
+        <p>Update your username. Confirm with your current password.</p>
+        <div id="profileMessage" class="message"></div>
+        <form id="profileForm" class="stack">
+          <label class="field">
+            <span>Username</span>
+            <input id="profileUsername" type="text" maxlength="64" required>
+          </label>
+          <label class="field">
+            <span>Current Password</span>
+            <input id="profileCurrentPassword" type="password" autocomplete="current-password" maxlength="128" required>
+          </label>
+          <div class="actions">
+            <button id="profileCancelButton" class="button ghost" type="button">Cancel</button>
+            <button class="button primary" type="submit">Save Changes</button>
+          </div>
+        </form>
+      </div>
+    </div>
+
+    <div id="passwordOverlay" class="modal-overlay" hidden>
+      <div class="modal-card" role="dialog" aria-labelledby="passwordTitle">
+        <h2 id="passwordTitle">Change Password</h2>
+        <p>Enter your current password and pick a new one (minimum 6 characters).</p>
+        <div id="passwordMessage" class="message"></div>
+        <form id="passwordForm" class="stack">
+          <label class="field">
+            <span>Current Password</span>
+            <input id="passwordCurrent" type="password" autocomplete="current-password" maxlength="128" required>
+          </label>
+          <label class="field">
+            <span>New Password</span>
+            <input id="passwordNew" type="password" autocomplete="new-password" minlength="6" maxlength="128" required>
+          </label>
+          <label class="field">
+            <span>Confirm New Password</span>
+            <input id="passwordNewConfirm" type="password" autocomplete="new-password" minlength="6" maxlength="128" required>
+          </label>
+          <div class="actions">
+            <button id="passwordCancelButton" class="button ghost" type="button">Cancel</button>
+            <button class="button primary" type="submit">Update Password</button>
+          </div>
+        </form>
+      </div>
+    </div>
   `;
 
   bindInventoryHandlers();
@@ -303,6 +454,9 @@ function renderInventoryView() {
 
 function bindInventoryHandlers() {
   document.querySelector("#logoutButton").addEventListener("click", handleLogout);
+  document.querySelector("#editProfileButton").addEventListener("click", openProfileModal);
+  document.querySelector("#changePasswordButton").addEventListener("click", openPasswordModal);
+
   document.querySelector("#productForm").addEventListener("submit", handleProductSubmit);
   document.querySelector("#resetButton").addEventListener("click", resetForm);
   document.querySelector("#addCustomFieldButton").addEventListener("click", () => addCustomFieldRow());
@@ -328,10 +482,24 @@ function bindInventoryHandlers() {
   document.querySelector("#tableWrap").addEventListener("click", handleTableClick);
 
   document.querySelector("#confirmCancelButton").addEventListener("click", closeDeleteModal);
-  document.querySelector("#toggleConfirmPasswordButton").addEventListener("click", toggleConfirmPasswordVisibility);
+  document.querySelector("#toggleConfirmPasswordButton").addEventListener("click", () =>
+    togglePasswordVisibility("#confirmPassword", "#toggleConfirmPasswordButton")
+  );
   document.querySelector("#confirmForm").addEventListener("submit", handleConfirmedDelete);
   document.querySelector("#confirmOverlay").addEventListener("click", (event) => {
     if (event.target.id === "confirmOverlay") closeDeleteModal();
+  });
+
+  document.querySelector("#profileCancelButton").addEventListener("click", closeProfileModal);
+  document.querySelector("#profileForm").addEventListener("submit", handleProfileSubmit);
+  document.querySelector("#profileOverlay").addEventListener("click", (event) => {
+    if (event.target.id === "profileOverlay") closeProfileModal();
+  });
+
+  document.querySelector("#passwordCancelButton").addEventListener("click", closePasswordModal);
+  document.querySelector("#passwordForm").addEventListener("submit", handlePasswordSubmit);
+  document.querySelector("#passwordOverlay").addEventListener("click", (event) => {
+    if (event.target.id === "passwordOverlay") closePasswordModal();
   });
 
   setCustomFieldRows({});
@@ -699,20 +867,6 @@ function closeDeleteModal() {
   document.querySelector("#confirmOverlay").hidden = true;
 }
 
-function toggleConfirmPasswordVisibility() {
-  const input = document.querySelector("#confirmPassword");
-  const button = document.querySelector("#toggleConfirmPasswordButton");
-  if (input.type === "password") {
-    input.type = "text";
-    button.textContent = "Hide";
-    button.setAttribute("aria-label", "Hide password");
-  } else {
-    input.type = "password";
-    button.textContent = "Show";
-    button.setAttribute("aria-label", "Show password");
-  }
-}
-
 async function handleConfirmedDelete(event) {
   event.preventDefault();
   const confirmMessage = document.querySelector("#confirmMessage");
@@ -741,6 +895,93 @@ async function handleConfirmedDelete(event) {
   } catch (error) {
     if (error.status === 401) return goToLogin();
     showMessage(confirmMessage, error.message, "error");
+  }
+}
+
+/* ----- Edit Profile ----- */
+
+function openProfileModal() {
+  document.querySelector("#profileUsername").value = state.user ? state.user.username : "";
+  document.querySelector("#profileCurrentPassword").value = "";
+  clearMessage(document.querySelector("#profileMessage"));
+  document.querySelector("#profileOverlay").hidden = false;
+  document.querySelector("#profileUsername").focus();
+}
+
+function closeProfileModal() {
+  document.querySelector("#profileOverlay").hidden = true;
+}
+
+async function handleProfileSubmit(event) {
+  event.preventDefault();
+  const profileMessage = document.querySelector("#profileMessage");
+  const username = document.querySelector("#profileUsername").value.trim();
+  const currentPassword = document.querySelector("#profileCurrentPassword").value;
+
+  if (!username || !currentPassword) {
+    showMessage(profileMessage, "Enter username and current password.", "error");
+    return;
+  }
+
+  try {
+    const payload = await request("/api/auth/me", {
+      method: "PUT",
+      body: JSON.stringify({ username, current_password: currentPassword })
+    });
+    state.user = payload.user;
+    document.querySelector("#currentUsernameLabel").textContent = state.user.username;
+    if (window.localStorage.getItem("inventoryRemember") === "1") {
+      window.localStorage.setItem("inventoryUsername", state.user.username);
+    }
+    closeProfileModal();
+    showMessage(document.querySelector("#formMessage"), "Profile updated.", "success");
+  } catch (error) {
+    if (error.status === 401) return goToLogin();
+    showMessage(profileMessage, error.message, "error");
+  }
+}
+
+/* ----- Change Password ----- */
+
+function openPasswordModal() {
+  document.querySelector("#passwordCurrent").value = "";
+  document.querySelector("#passwordNew").value = "";
+  document.querySelector("#passwordNewConfirm").value = "";
+  clearMessage(document.querySelector("#passwordMessage"));
+  document.querySelector("#passwordOverlay").hidden = false;
+  document.querySelector("#passwordCurrent").focus();
+}
+
+function closePasswordModal() {
+  document.querySelector("#passwordOverlay").hidden = true;
+}
+
+async function handlePasswordSubmit(event) {
+  event.preventDefault();
+  const passwordMessage = document.querySelector("#passwordMessage");
+  const current = document.querySelector("#passwordCurrent").value;
+  const next = document.querySelector("#passwordNew").value;
+  const confirm = document.querySelector("#passwordNewConfirm").value;
+
+  if (!current || !next) {
+    showMessage(passwordMessage, "Fill in all fields.", "error");
+    return;
+  }
+  if (next !== confirm) {
+    showMessage(passwordMessage, "New passwords do not match.", "error");
+    return;
+  }
+
+  try {
+    await request("/api/auth/change-password", {
+      method: "POST",
+      body: JSON.stringify({ current_password: current, new_password: next })
+    });
+    closePasswordModal();
+    showMessage(document.querySelector("#formMessage"), "Password changed.", "success");
+  } catch (error) {
+    if (error.status === 401) return goToLogin();
+    showMessage(passwordMessage, error.message, "error");
   }
 }
 

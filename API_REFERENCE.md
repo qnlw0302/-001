@@ -8,13 +8,19 @@ http://127.0.0.1:5000
 
 ## Authentication
 
-Session-based via cookie (`inventory_session`). Log in with `POST /api/auth/login` and the browser will receive an `HttpOnly` session cookie that is automatically sent on subsequent requests. `POST`, `PUT`, and `DELETE` on `/api/products` require a logged-in session. `DELETE` additionally requires the current user's password in the request body for confirmation.
+Session-based via cookie (`inventory_session`). Log in with `POST /api/auth/login`
+or create an account with `POST /api/auth/register`; the browser will receive
+an `HttpOnly` session cookie that is automatically sent on subsequent requests.
+**All `/api/products` endpoints require a logged-in session** and return only
+the calling user's own products. `DELETE` additionally requires the current
+user's password in the request body for confirmation.
 
-The default admin account is seeded on first run from these environment variables (see `.env.example`):
+The default admin account is seeded on first run from these environment
+variables (see `.env.example`):
 
 ```text
 INVENTORY_ADMIN_USERNAME=admin
-INVENTORY_ADMIN_PASSWORD=admin123
+INVENTORY_ADMIN_PASSWORD=change-me-admin-password
 ```
 
 Change these before deploying anywhere real.
@@ -52,6 +58,40 @@ Field notes:
 { "status": "ok" }
 ```
 
+## POST /api/auth/register
+
+Creates a new user and starts a session. Registration is open — no existing
+account required.
+
+Request:
+
+```json
+{
+  "username": "alice",
+  "password": "at-least-six-chars",
+  "remember": true
+}
+```
+
+Validation:
+
+- `username` — 3–64 chars, no whitespace.
+- `password` — 6–128 chars.
+- `remember` — optional, defaults to `false`.
+
+Response (201):
+
+```json
+{
+  "user": { "id": 2, "username": "alice" }
+}
+```
+
+Errors:
+
+- `400` — validation failed (bad username / short password / …)
+- `409 Username already taken.`
+
 ## POST /api/auth/login
 
 Request:
@@ -59,7 +99,7 @@ Request:
 ```json
 {
   "username": "admin",
-  "password": "admin123",
+  "password": "change-me-admin-password",
   "remember": true
 }
 ```
@@ -90,7 +130,53 @@ Clears the session. Returns:
 
 Returns the logged-in user, or `401` with `{ "user": null }` when not authenticated.
 
+## PUT /api/auth/me
+
+Requires login. Updates the calling user's username. The current password must
+be supplied as a confirmation step.
+
+Request:
+
+```json
+{
+  "username": "new-name",
+  "current_password": "current-pw"
+}
+```
+
+Responses:
+
+- `200 { "user": { "id": 1, "username": "new-name" } }`
+- `400` validation failed
+- `403 Current password is incorrect.`
+- `409 Username already taken.`
+
+Passing the same username the user already has is a no-op and returns the
+current user unchanged.
+
+## POST /api/auth/change-password
+
+Requires login. Changes the calling user's password. The session remains valid
+after the change.
+
+Request:
+
+```json
+{
+  "current_password": "current-pw",
+  "new_password": "at-least-six-chars"
+}
+```
+
+Responses:
+
+- `200 { "message": "Password changed." }`
+- `400` — validation failed, or new password equals current
+- `403 Current password is incorrect.`
+
 ## GET /api/products
+
+Requires login. Only the calling user's products are returned.
 
 Query parameters: `search`, `page`, `limit`.
 
@@ -111,7 +197,9 @@ Response:
 
 ## GET /api/products/{id}
 
-Returns a single Product object, or `404` if not found.
+Requires login. Returns a single Product object, or `404` if the product does
+not exist **or belongs to another user** (the response is intentionally
+indistinguishable in the two cases to avoid leaking ownership information).
 
 ## POST /api/products
 
@@ -162,7 +250,7 @@ Requires login **and** password re-confirmation in the request body.
 Request:
 
 ```json
-{ "password": "admin123" }
+{ "password": "change-me-admin-password" }
 ```
 
 Responses:

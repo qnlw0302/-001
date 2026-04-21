@@ -11,7 +11,9 @@ from flask import Flask, current_app, g, jsonify, make_response, request, send_f
 
 from auth import (
     current_user,
+    current_user_id,
     ensure_seed_admin,
+    hash_password,
     login_required,
     login_user,
     logout_user,
@@ -20,15 +22,28 @@ from auth import (
 )
 from crud import (
     connect_db,
+    create_user,
     delete_product,
     get_product,
+    get_user_by_id,
     get_user_by_username,
-    init_db,
+    init_products_table,
+    init_users_table,
     insert_product,
     list_products,
     update_product,
+    update_user_password,
+    update_user_username,
 )
-from schemas import DeleteConfirmation, LoginRequest, ProductCreate, ProductUpdate
+from schemas import (
+    ChangePasswordRequest,
+    DeleteConfirmation,
+    LoginRequest,
+    ProductCreate,
+    ProductUpdate,
+    RegisterRequest,
+    UpdateProfileRequest,
+)
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -68,7 +83,7 @@ def create_app(test_config: Optional[Dict[str, Any]] = None) -> Flask:
         CORS_ORIGIN=os.getenv("INVENTORY_CORS_ORIGIN", "http://127.0.0.1:5173"),
         LOG_LEVEL=os.getenv("INVENTORY_LOG_LEVEL", "INFO"),
         ADMIN_USERNAME=os.getenv("INVENTORY_ADMIN_USERNAME", "admin"),
-        ADMIN_PASSWORD=os.getenv("INVENTORY_ADMIN_PASSWORD", "admin123"),
+        ADMIN_PASSWORD=os.getenv("INVENTORY_ADMIN_PASSWORD", "change-me-admin-password"),
         FRONTEND_DIR=str(FRONTEND_DIR),
         JSON_SORT_KEYS=False,
         PERMANENT_SESSION_LIFETIME=timedelta(days=30),
@@ -102,13 +117,14 @@ def configure_logging(app: Flask) -> None:
 def initialize_database(app: Flask) -> None:
     connection = connect_db(app.config["DB_PATH"])
     try:
-        init_db(connection)
+        init_users_table(connection)
         with app.app_context():
-            ensure_seed_admin(
+            admin_id = ensure_seed_admin(
                 connection,
                 app.config["ADMIN_USERNAME"],
                 app.config["ADMIN_PASSWORD"],
             )
+        init_products_table(connection, default_owner_id=admin_id)
     finally:
         connection.close()
 
@@ -192,6 +208,16 @@ def register_routes(app: Flask) -> None:
     def health() -> Any:
         return jsonify({"status": "ok"})
 
+    @app.route("/api/auth/register", methods=["POST"])
+    def api_register() -> Any:
+        payload = read_json_body()
+        data = RegisterRequest.from_payload(payload)
+        if get_user_by_username(get_db(), data.username) is not None:
+            raise ApiError("Username already taken.", 409)
+        user = create_user(get_db(), data.username, hash_password(data.password))
+        login_user(user.id, data.remember)
+        return jsonify({"user": user.to_dict()}), 201
+
     @app.route("/api/auth/login", methods=["POST"])
     def api_login() -> Any:
         payload = read_json_body()
@@ -214,17 +240,61 @@ def register_routes(app: Flask) -> None:
             return jsonify({"user": None}), 401
         return jsonify({"user": user.to_dict()})
 
+    @app.route("/api/auth/me", methods=["PUT"])
+    @login_required
+    def api_update_me() -> Any:
+        payload = read_json_body()
+        data = UpdateProfileRequest.from_payload(payload)
+        user_id = require_user_id()
+
+        if not verify_current_password(get_db(), data.current_password):
+            raise ApiError("Current password is incorrect.", 403)
+
+        existing = get_user_by_username(get_db(), data.username)
+        if existing is not None and int(existing["id"]) != user_id:
+            raise ApiError("Username already taken.", 409)
+
+        if existing is not None and int(existing["id"]) == user_id:
+            user = get_user_by_id(get_db(), user_id)
+        else:
+            user = update_user_username(get_db(), user_id, data.username)
+
+        if user is None:
+            raise LookupError("User not found.")
+        return jsonify({"user": user.to_dict()})
+
+    @app.route("/api/auth/change-password", methods=["POST"])
+    @login_required
+    def api_change_password() -> Any:
+        payload = read_json_body()
+        data = ChangePasswordRequest.from_payload(payload)
+        user_id = require_user_id()
+
+        if not verify_current_password(get_db(), data.current_password):
+            raise ApiError("Current password is incorrect.", 403)
+
+        update_user_password(get_db(), user_id, hash_password(data.new_password))
+        return jsonify({"message": "Password changed."})
+
     @app.route("/api/products", methods=["GET"])
+    @login_required
     def api_list_products() -> Any:
         search = request.args.get("search", "").strip()
         page = parse_positive_int(request.args.get("page", "1"), "page")
         limit = parse_positive_int(request.args.get("limit", "10"), "limit")
-        payload = list_products(get_db(), search=search, page=page, limit=limit)
+        payload = list_products(
+            get_db(),
+            user_id=require_user_id(),
+            search=search,
+            page=page,
+            limit=limit,
+        )
         return jsonify(payload)
 
     @app.route("/api/products/<int:product_id>", methods=["GET"])
+    @login_required
     def api_get_product(product_id: int) -> Any:
-        product = get_product(get_db(), product_id)
+        product = get_product(get_db(), require_user_id(), product_id)
         if product is None:
             raise LookupError("Product not found.")
         return jsonify(product.to_dict())
@@ -233,14 +303,23 @@ def register_routes(app: Flask) -> None:
     @login_required
     def api_insert_product() -> Any:
         payload = read_json_body()
-        product = insert_product(get_db(), ProductCreate.from_payload(payload))
+        product = insert_product(
+            get_db(),
+            require_user_id(),
+            ProductCreate.from_payload(payload),
+        )
         return jsonify(product.to_dict()), 201
 
     @app.route("/api/products/<int:product_id>", methods=["PUT"])
     @login_required
     def api_update_product(product_id: int) -> Any:
         payload = read_json_body()
-        product = update_product(get_db(), product_id, ProductUpdate.from_payload(payload))
+        product = update_product(
+            get_db(),
+            require_user_id(),
+            product_id,
+            ProductUpdate.from_payload(payload),
+        )
         return jsonify(product.to_dict())
 
     @app.route("/api/products/<int:product_id>", methods=["DELETE"])
@@ -250,7 +329,7 @@ def register_routes(app: Flask) -> None:
         confirmation = DeleteConfirmation.from_payload(payload)
         if not verify_current_password(get_db(), confirmation.password):
             raise ApiError("Password does not match.", 403)
-        deleted = delete_product(get_db(), product_id)
+        deleted = delete_product(get_db(), require_user_id(), product_id)
         if not deleted:
             raise LookupError("Product not found.")
         return jsonify({"message": "Product deleted."})
@@ -281,6 +360,13 @@ def get_db() -> sqlite3.Connection:
     if "db" not in g:
         g.db = connect_db(current_app.config["DB_PATH"])
     return g.db
+
+
+def require_user_id() -> int:
+    user_id = current_user_id()
+    if user_id is None:
+        raise ApiError("Authentication required.", 401)
+    return user_id
 
 
 def parse_positive_int(raw_value: str, field_name: str) -> int:

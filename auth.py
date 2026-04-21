@@ -4,10 +4,15 @@ import sqlite3
 from functools import wraps
 from typing import Any, Callable, Optional
 
-from flask import current_app, g, jsonify, session
+from flask import current_app, jsonify, session
 from werkzeug.security import check_password_hash, generate_password_hash
 
-from crud import create_user, get_password_hash, get_user_by_id, get_user_by_username
+from crud import (
+    create_user,
+    get_password_hash,
+    get_user_by_id,
+    get_user_by_username,
+)
 from schemas import User
 
 
@@ -27,6 +32,13 @@ def current_user(connection: sqlite3.Connection) -> Optional[User]:
     if not user_id:
         return None
     return get_user_by_id(connection, int(user_id))
+
+
+def current_user_id() -> Optional[int]:
+    user_id = session.get(SESSION_USER_KEY)
+    if not user_id:
+        return None
+    return int(user_id)
 
 
 def verify_current_password(connection: sqlite3.Connection, password: str) -> bool:
@@ -63,12 +75,13 @@ def ensure_seed_admin(
     connection: sqlite3.Connection,
     username: str,
     password: str,
-) -> None:
+) -> Optional[int]:
     username = (username or "").strip()
     if not username or not password:
-        return
+        return None
     existing = get_user_by_username(connection, username)
     if existing is not None:
-        return
-    create_user(connection, username, hash_password(password))
+        return int(existing["id"])
+    user = create_user(connection, username, hash_password(password))
     current_app.logger.info("Seeded admin user %r.", username)
+    return user.id

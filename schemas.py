@@ -180,6 +180,7 @@ class Product:
     stock_qty: int
     low_stock_threshold: Optional[int] = None
     custom_fields: Dict[str, Any] = field(default_factory=dict)
+    user_id: Optional[int] = None
 
     @property
     def effective_threshold(self) -> int:
@@ -261,6 +262,7 @@ class ProductUpdate:
         return update
 
 
+USERNAME_MIN_LENGTH = 3
 USERNAME_MAX_LENGTH = 64
 PASSWORD_MIN_LENGTH = 6
 PASSWORD_MAX_LENGTH = 128
@@ -275,6 +277,52 @@ def _read_required_bool(payload: Mapping[str, Any], key: str) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in ("1", "true", "yes", "on")
     return False
+
+
+def _read_username(payload: Mapping[str, Any], key: str = "username") -> str:
+    value = payload.get(key)
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("Username is required.")
+    username = value.strip()
+    if len(username) < USERNAME_MIN_LENGTH:
+        raise ValueError(
+            f"Username must be at least {USERNAME_MIN_LENGTH} characters."
+        )
+    if len(username) > USERNAME_MAX_LENGTH:
+        raise ValueError(
+            f"Username must be {USERNAME_MAX_LENGTH} characters or fewer."
+        )
+    if any(ch.isspace() for ch in username):
+        raise ValueError("Username must not contain whitespace.")
+    return username
+
+
+def _read_new_password(
+    payload: Mapping[str, Any],
+    key: str = "password",
+    label: str = "Password",
+) -> str:
+    value = payload.get(key)
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{label} is required.")
+    if len(value) < PASSWORD_MIN_LENGTH:
+        raise ValueError(f"{label} must be at least {PASSWORD_MIN_LENGTH} characters.")
+    if len(value) > PASSWORD_MAX_LENGTH:
+        raise ValueError(f"{label} must be {PASSWORD_MAX_LENGTH} characters or fewer.")
+    return value
+
+
+def _read_existing_password(
+    payload: Mapping[str, Any],
+    key: str,
+    label: str,
+) -> str:
+    value = payload.get(key)
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{label} is required.")
+    if len(value) > PASSWORD_MAX_LENGTH:
+        raise ValueError(f"{label} must be {PASSWORD_MAX_LENGTH} characters or fewer.")
+    return value
 
 
 @dataclass
@@ -310,6 +358,52 @@ class LoginRequest:
             password=password,
             remember=_read_required_bool(payload, "remember"),
         )
+
+
+@dataclass
+class RegisterRequest:
+    username: str
+    password: str
+    remember: bool = False
+
+    @classmethod
+    def from_payload(cls, payload: Mapping[str, Any]) -> "RegisterRequest":
+        return cls(
+            username=_read_username(payload, "username"),
+            password=_read_new_password(payload, "password", "Password"),
+            remember=_read_required_bool(payload, "remember"),
+        )
+
+
+@dataclass
+class UpdateProfileRequest:
+    username: str
+    current_password: str
+
+    @classmethod
+    def from_payload(cls, payload: Mapping[str, Any]) -> "UpdateProfileRequest":
+        return cls(
+            username=_read_username(payload, "username"),
+            current_password=_read_existing_password(
+                payload, "current_password", "Current password"
+            ),
+        )
+
+
+@dataclass
+class ChangePasswordRequest:
+    current_password: str
+    new_password: str
+
+    @classmethod
+    def from_payload(cls, payload: Mapping[str, Any]) -> "ChangePasswordRequest":
+        current_password = _read_existing_password(
+            payload, "current_password", "Current password"
+        )
+        new_password = _read_new_password(payload, "new_password", "New password")
+        if new_password == current_password:
+            raise ValueError("New password must differ from current password.")
+        return cls(current_password=current_password, new_password=new_password)
 
 
 @dataclass

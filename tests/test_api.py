@@ -11,7 +11,7 @@ ADMIN_USERNAME = "admin"
 ADMIN_PASSWORD = "test-pass-123"
 
 
-class InventoryApiTestCase(unittest.TestCase):
+class _ApiTestMixin:
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
         self.db_path = Path(self.temp_dir.name) / "test_inventory.db"
@@ -42,6 +42,9 @@ class InventoryApiTestCase(unittest.TestCase):
             "/api/products",
             json={"sku": sku, "name": name, "stock_qty": stock_qty},
         )
+
+
+class InventoryApiTestCase(_ApiTestMixin, unittest.TestCase):
 
     def test_health_endpoint(self) -> None:
         response = self.client.get("/health")
@@ -274,6 +277,237 @@ class InventoryApiTestCase(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 400)
         self.assertIn("Custom field", response.get_json()["error"])
+
+    def test_list_products_requires_login(self) -> None:
+        response = self.client.get("/api/products")
+        self.assertEqual(response.status_code, 401)
+
+    def test_get_single_product_requires_login(self) -> None:
+        response = self.client.get("/api/products/1")
+        self.assertEqual(response.status_code, 401)
+
+
+class RegistrationTestCase(_ApiTestMixin, unittest.TestCase):
+    def test_register_creates_user_and_starts_session(self) -> None:
+        response = self.client.post(
+            "/api/auth/register",
+            json={"username": "alice", "password": "alice-pass-123"},
+        )
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.get_json()["user"]["username"], "alice")
+
+        me = self.client.get("/api/auth/me")
+        self.assertEqual(me.status_code, 200)
+        self.assertEqual(me.get_json()["user"]["username"], "alice")
+
+    def test_register_rejects_duplicate_username(self) -> None:
+        first = self.client.post(
+            "/api/auth/register",
+            json={"username": "alice", "password": "alice-pass-123"},
+        )
+        self.assertEqual(first.status_code, 201)
+
+        second = self.client.post(
+            "/api/auth/register",
+            json={"username": "alice", "password": "other-pass-456"},
+        )
+        self.assertEqual(second.status_code, 409)
+        self.assertIn("taken", second.get_json()["error"])
+
+    def test_register_rejects_short_password(self) -> None:
+        response = self.client.post(
+            "/api/auth/register",
+            json={"username": "bob", "password": "short"},
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("characters", response.get_json()["error"])
+
+    def test_register_rejects_whitespace_username(self) -> None:
+        response = self.client.post(
+            "/api/auth/register",
+            json={"username": "bad name", "password": "decent-pass"},
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_password_is_stored_hashed(self) -> None:
+        self.client.post(
+            "/api/auth/register",
+            json={"username": "carol", "password": "carol-pass-123"},
+        )
+        import sqlite3
+        connection = sqlite3.connect(str(self.db_path))
+        connection.row_factory = sqlite3.Row
+        row = connection.execute(
+            "SELECT password_hash FROM users WHERE username = ?", ("carol",)
+        ).fetchone()
+        connection.close()
+        self.assertIsNotNone(row)
+        self.assertNotEqual(row["password_hash"], "carol-pass-123")
+        self.assertTrue(row["password_hash"].startswith("pbkdf2:"))
+
+
+class ChangePasswordTestCase(_ApiTestMixin, unittest.TestCase):
+    def test_change_password_requires_login(self) -> None:
+        response = self.client.post(
+            "/api/auth/change-password",
+            json={"current_password": ADMIN_PASSWORD, "new_password": "new-pass-123"},
+        )
+        self.assertEqual(response.status_code, 401)
+
+    def test_change_password_rejects_wrong_current(self) -> None:
+        self.login()
+        response = self.client.post(
+            "/api/auth/change-password",
+            json={"current_password": "wrong", "new_password": "new-pass-123"},
+        )
+        self.assertEqual(response.status_code, 403)
+
+    def test_change_password_rejects_same_as_current(self) -> None:
+        self.login()
+        response = self.client.post(
+            "/api/auth/change-password",
+            json={"current_password": ADMIN_PASSWORD, "new_password": ADMIN_PASSWORD},
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_change_password_allows_login_with_new_password(self) -> None:
+        self.login()
+        response = self.client.post(
+            "/api/auth/change-password",
+            json={"current_password": ADMIN_PASSWORD, "new_password": "new-pass-123"},
+        )
+        self.assertEqual(response.status_code, 200)
+
+        self.client.post("/api/auth/logout")
+
+        old_login = self.login(password=ADMIN_PASSWORD)
+        self.assertEqual(old_login.status_code, 401)
+
+        new_login = self.login(password="new-pass-123")
+        self.assertEqual(new_login.status_code, 200)
+
+
+class UpdateProfileTestCase(_ApiTestMixin, unittest.TestCase):
+    def test_update_profile_changes_username(self) -> None:
+        self.login()
+        response = self.client.put(
+            "/api/auth/me",
+            json={"username": "admin2", "current_password": ADMIN_PASSWORD},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["user"]["username"], "admin2")
+
+        self.client.post("/api/auth/logout")
+        login_with_new = self.login(username="admin2")
+        self.assertEqual(login_with_new.status_code, 200)
+
+    def test_update_profile_requires_current_password(self) -> None:
+        self.login()
+        response = self.client.put(
+            "/api/auth/me",
+            json={"username": "admin2", "current_password": "wrong"},
+        )
+        self.assertEqual(response.status_code, 403)
+
+    def test_update_profile_rejects_taken_username(self) -> None:
+        self.client.post(
+            "/api/auth/register",
+            json={"username": "taken", "password": "taken-pass-123"},
+        )
+        self.client.post("/api/auth/logout")
+        self.login()
+
+        response = self.client.put(
+            "/api/auth/me",
+            json={"username": "taken", "current_password": ADMIN_PASSWORD},
+        )
+        self.assertEqual(response.status_code, 409)
+
+    def test_update_profile_same_username_is_noop(self) -> None:
+        self.login()
+        response = self.client.put(
+            "/api/auth/me",
+            json={"username": ADMIN_USERNAME, "current_password": ADMIN_PASSWORD},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["user"]["username"], ADMIN_USERNAME)
+
+
+class TenancyIsolationTestCase(_ApiTestMixin, unittest.TestCase):
+    def _register(self, username: str, password: str):
+        return self.client.post(
+            "/api/auth/register",
+            json={"username": username, "password": password},
+        )
+
+    def test_users_only_see_their_own_products(self) -> None:
+        self._register("alice", "alice-pass-123")
+        self.client.post("/api/products", json={"sku": "A-1", "name": "Alice Widget", "stock_qty": 5})
+        self.client.post("/api/auth/logout")
+
+        self._register("bob", "bob-pass-12345")
+        self.client.post("/api/products", json={"sku": "B-1", "name": "Bob Gadget", "stock_qty": 3})
+
+        listing = self.client.get("/api/products").get_json()
+        skus = [item["sku"] for item in listing["items"]]
+        self.assertEqual(skus, ["B-1"])
+        self.assertEqual(listing["summary"]["total_products"], 1)
+
+    def test_user_cannot_fetch_anothers_product(self) -> None:
+        self._register("alice", "alice-pass-123")
+        created = self.client.post(
+            "/api/products", json={"sku": "A-1", "name": "Alice Widget", "stock_qty": 5}
+        )
+        product_id = created.get_json()["id"]
+        self.client.post("/api/auth/logout")
+
+        self._register("bob", "bob-pass-12345")
+        response = self.client.get("/api/products/%s" % product_id)
+        self.assertEqual(response.status_code, 404)
+
+    def test_user_cannot_update_anothers_product(self) -> None:
+        self._register("alice", "alice-pass-123")
+        created = self.client.post(
+            "/api/products", json={"sku": "A-1", "name": "Alice Widget", "stock_qty": 5}
+        )
+        product_id = created.get_json()["id"]
+        self.client.post("/api/auth/logout")
+
+        self._register("bob", "bob-pass-12345")
+        response = self.client.put(
+            "/api/products/%s" % product_id,
+            json={"name": "Hijacked"},
+        )
+        self.assertEqual(response.status_code, 404)
+
+    def test_user_cannot_delete_anothers_product(self) -> None:
+        self._register("alice", "alice-pass-123")
+        created = self.client.post(
+            "/api/products", json={"sku": "A-1", "name": "Alice Widget", "stock_qty": 5}
+        )
+        product_id = created.get_json()["id"]
+        self.client.post("/api/auth/logout")
+
+        self._register("bob", "bob-pass-12345")
+        response = self.client.delete(
+            "/api/products/%s" % product_id,
+            json={"password": "bob-pass-12345"},
+        )
+        self.assertEqual(response.status_code, 404)
+
+    def test_same_sku_allowed_across_different_users(self) -> None:
+        self._register("alice", "alice-pass-123")
+        alice_create = self.client.post(
+            "/api/products", json={"sku": "SHARED", "name": "Alice", "stock_qty": 5}
+        )
+        self.assertEqual(alice_create.status_code, 201)
+        self.client.post("/api/auth/logout")
+
+        self._register("bob", "bob-pass-12345")
+        bob_create = self.client.post(
+            "/api/products", json={"sku": "SHARED", "name": "Bob", "stock_qty": 7}
+        )
+        self.assertEqual(bob_create.status_code, 201)
 
 
 if __name__ == "__main__":

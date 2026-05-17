@@ -4,11 +4,67 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from main import BASE_DIR, create_app
+from main import BASE_DIR, CSRF_HEADER, create_app
 
 
 ADMIN_USERNAME = "admin"
 ADMIN_PASSWORD = "test-pass-123"
+
+
+class CsrfTestClient:
+    """Wraps Flask's test client to inject the CSRF header on mutating requests."""
+
+    _MUTATING_METHODS = {"POST", "PUT", "DELETE", "PATCH"}
+
+    def __init__(self, app):
+        self._client = app.test_client()
+        self._csrf_token: str | None = None
+
+    def _ensure_csrf_token(self) -> str:
+        if self._csrf_token:
+            return self._csrf_token
+        response = self._client.get("/api/auth/csrf")
+        if response.status_code != 200:
+            raise RuntimeError("CSRF token endpoint failed.")
+        token = response.get_json()["csrf_token"]
+        self._csrf_token = token
+        return token
+
+    _SESSION_ROTATING_PATHS = {
+        "/api/auth/login",
+        "/api/auth/logout",
+        "/api/auth/register",
+    }
+
+    def _attach_csrf(self, method: str, kwargs: dict) -> dict:
+        if method.upper() not in self._MUTATING_METHODS:
+            return kwargs
+        headers = dict(kwargs.get("headers") or {})
+        if CSRF_HEADER not in headers:
+            headers[CSRF_HEADER] = self._ensure_csrf_token()
+        kwargs["headers"] = headers
+        return kwargs
+
+    def _maybe_invalidate_token(self, path: str) -> None:
+        if path in self._SESSION_ROTATING_PATHS:
+            self._csrf_token = None
+
+    def get(self, path: str, *args, **kwargs):
+        return self._client.get(path, *args, **kwargs)
+
+    def post(self, path: str, *args, **kwargs):
+        response = self._client.post(path, *args, **self._attach_csrf("POST", kwargs))
+        self._maybe_invalidate_token(path)
+        return response
+
+    def put(self, path: str, *args, **kwargs):
+        return self._client.put(path, *args, **self._attach_csrf("PUT", kwargs))
+
+    def delete(self, path: str, *args, **kwargs):
+        return self._client.delete(path, *args, **self._attach_csrf("DELETE", kwargs))
+
+    def open(self, *args, **kwargs):
+        return self._client.open(*args, **kwargs)
 
 
 class _ApiTestMixin:
@@ -24,9 +80,13 @@ class _ApiTestMixin:
                 "ADMIN_PASSWORD": ADMIN_PASSWORD,
                 "FRONTEND_DIR": str(BASE_DIR / "inventory-management-web"),
                 "LOG_LEVEL": "CRITICAL",
+                # Rate-limit is generous enough not to interfere with the test
+                # suite by default; specific tests that exercise it lower the
+                # limit on their own app instance.
+                "AUTH_RATE_LIMIT_MAX": 10_000,
             }
         )
-        self.client = self.app.test_client()
+        self.client = CsrfTestClient(self.app)
 
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
@@ -508,6 +568,187 @@ class TenancyIsolationTestCase(_ApiTestMixin, unittest.TestCase):
             "/api/products", json={"sku": "SHARED", "name": "Bob", "stock_qty": 7}
         )
         self.assertEqual(bob_create.status_code, 201)
+
+
+class CsrfProtectionTestCase(_ApiTestMixin, unittest.TestCase):
+    def test_post_without_csrf_header_is_rejected(self) -> None:
+        # Use the raw client (no CSRF helper) to confirm the middleware fires.
+        raw = self.app.test_client()
+        response = raw.post(
+            "/api/auth/login",
+            json={"username": ADMIN_USERNAME, "password": ADMIN_PASSWORD},
+        )
+        self.assertEqual(response.status_code, 403)
+        self.assertIn("CSRF", response.get_json()["error"])
+
+    def test_csrf_token_endpoint_returns_token(self) -> None:
+        response = self.client.get("/api/auth/csrf")
+        self.assertEqual(response.status_code, 200)
+        token = response.get_json()["csrf_token"]
+        self.assertIsInstance(token, str)
+        self.assertGreaterEqual(len(token), 32)
+
+    def test_get_requests_do_not_require_csrf(self) -> None:
+        raw = self.app.test_client()
+        response = raw.get("/api/auth/me")
+        self.assertEqual(response.status_code, 401)
+
+
+class RateLimitTestCase(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.app = create_app(
+            {
+                "TESTING": True,
+                "DB_PATH": str(Path(self.temp_dir.name) / "test.db"),
+                "SECRET_KEY": "test",
+                "ADMIN_USERNAME": ADMIN_USERNAME,
+                "ADMIN_PASSWORD": ADMIN_PASSWORD,
+                "FRONTEND_DIR": str(BASE_DIR / "inventory-management-web"),
+                "LOG_LEVEL": "CRITICAL",
+                "AUTH_RATE_LIMIT_MAX": 3,
+                "AUTH_RATE_LIMIT_WINDOW": 60,
+            }
+        )
+        self.client = CsrfTestClient(self.app)
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    def test_repeated_logins_are_rate_limited(self) -> None:
+        for _ in range(3):
+            response = self.client.post(
+                "/api/auth/login",
+                json={"username": ADMIN_USERNAME, "password": "wrong-pass"},
+            )
+            self.assertIn(response.status_code, (401, 429))
+
+        blocked = self.client.post(
+            "/api/auth/login",
+            json={"username": ADMIN_USERNAME, "password": "wrong-pass"},
+        )
+        self.assertEqual(blocked.status_code, 429)
+        self.assertIn("Too many", blocked.get_json()["error"])
+
+
+class AccountLockoutTestCase(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.app = create_app(
+            {
+                "TESTING": True,
+                "DB_PATH": str(Path(self.temp_dir.name) / "test.db"),
+                "SECRET_KEY": "test",
+                "ADMIN_USERNAME": ADMIN_USERNAME,
+                "ADMIN_PASSWORD": ADMIN_PASSWORD,
+                "FRONTEND_DIR": str(BASE_DIR / "inventory-management-web"),
+                "LOG_LEVEL": "CRITICAL",
+                "AUTH_RATE_LIMIT_MAX": 10_000,
+                "LOGIN_MAX_ATTEMPTS": 3,
+                "LOGIN_LOCKOUT_SECONDS": 600,
+            }
+        )
+        self.client = CsrfTestClient(self.app)
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    def test_account_locks_after_repeated_failed_logins(self) -> None:
+        for _ in range(3):
+            failed = self.client.post(
+                "/api/auth/login",
+                json={"username": ADMIN_USERNAME, "password": "wrong-pass"},
+            )
+            self.assertEqual(failed.status_code, 401)
+
+        locked = self.client.post(
+            "/api/auth/login",
+            json={"username": ADMIN_USERNAME, "password": ADMIN_PASSWORD},
+        )
+        self.assertEqual(locked.status_code, 429)
+        payload = locked.get_json()
+        self.assertIn("locked", payload["error"].lower())
+        self.assertGreater(payload["retry_after_seconds"], 0)
+
+
+class PasswordStrengthTestCase(_ApiTestMixin, unittest.TestCase):
+    def test_register_rejects_common_password(self) -> None:
+        response = self.client.post(
+            "/api/auth/register",
+            json={"username": "newuser", "password": "password"},
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("common", response.get_json()["error"].lower())
+
+
+class ExportTestCase(_ApiTestMixin, unittest.TestCase):
+    def test_export_json_returns_all_products(self) -> None:
+        self.login()
+        self.create_product("E-1", "Alpha", 5)
+        self.create_product("E-2", "Beta", 8)
+
+        response = self.client.get("/api/products/export?format=json")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.mimetype, "application/json")
+        payload = response.get_json()
+        self.assertEqual(len(payload["items"]), 2)
+        self.assertEqual({item["sku"] for item in payload["items"]}, {"E-1", "E-2"})
+
+    def test_export_csv_returns_attachment(self) -> None:
+        self.login()
+        self.create_product("E-1", "Alpha", 5)
+        response = self.client.get("/api/products/export?format=csv")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.mimetype, "text/csv")
+        self.assertIn("attachment", response.headers.get("Content-Disposition", ""))
+        body = response.get_data(as_text=True)
+        self.assertIn("sku", body.splitlines()[0])
+        self.assertIn("E-1", body)
+
+    def test_export_requires_login(self) -> None:
+        response = self.client.get("/api/products/export?format=json")
+        self.assertEqual(response.status_code, 401)
+
+    def test_export_rejects_unknown_format(self) -> None:
+        self.login()
+        response = self.client.get("/api/products/export?format=xml")
+        self.assertEqual(response.status_code, 400)
+
+
+class AuditLogTestCase(_ApiTestMixin, unittest.TestCase):
+    def test_audit_log_captures_product_changes(self) -> None:
+        self.login()
+        created = self.create_product("A-1", "Alpha", 5)
+        product_id = created.get_json()["id"]
+
+        self.client.put(
+            "/api/products/%s" % product_id,
+            json={"name": "Renamed"},
+        )
+        self.client.delete(
+            "/api/products/%s" % product_id,
+            json={"password": ADMIN_PASSWORD},
+        )
+
+        response = self.client.get("/api/auth/audit?limit=50")
+        self.assertEqual(response.status_code, 200)
+        events = response.get_json()["items"]
+        actions = [event["action"] for event in events]
+        self.assertIn("product.create", actions)
+        self.assertIn("product.update", actions)
+        self.assertIn("product.delete", actions)
+        self.assertIn("auth.login", actions)
+
+
+class ReadinessTestCase(_ApiTestMixin, unittest.TestCase):
+    def test_health_endpoint_returns_ok(self) -> None:
+        response = self.client.get("/health")
+        self.assertEqual(response.status_code, 200)
+
+    def test_ready_endpoint_returns_ready_when_db_reachable(self) -> None:
+        response = self.client.get("/ready")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["status"], "ready")
 
 
 if __name__ == "__main__":

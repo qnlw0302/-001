@@ -25,6 +25,41 @@ INVENTORY_ADMIN_PASSWORD=change-me-admin-password
 
 Change these before deploying anywhere real.
 
+### CSRF protection
+
+All mutating requests on `/api/*` (`POST`, `PUT`, `DELETE`, `PATCH`) require
+an `X-CSRF-Token` header. The token is bound to the current session — fetch
+it from `GET /api/auth/csrf` and re-fetch after login/logout/register because
+those rotate the session.
+
+```bash
+curl -s -c cookies.txt http://127.0.0.1:5000/api/auth/csrf
+# {"csrf_token": "…"}
+curl -X POST http://127.0.0.1:5000/api/auth/login \
+  -H "Content-Type: application/json" \
+  -H "X-CSRF-Token: <token>" \
+  -b cookies.txt -c cookies.txt \
+  -d '{"username":"admin","password":"…"}'
+```
+
+A missing or invalid token returns `403 CSRF token missing or invalid.`
+
+### Rate limiting
+
+`POST /api/auth/login` and `POST /api/auth/register` are rate-limited per IP
+(`INVENTORY_AUTH_RATE_LIMIT_MAX` requests in
+`INVENTORY_AUTH_RATE_LIMIT_WINDOW` seconds, default 10/60). Excess requests
+get `429 Too many requests. Try again in a moment.`
+
+### Account lockout
+
+After `INVENTORY_LOGIN_MAX_ATTEMPTS` consecutive failed logins (default 5)
+the account is locked for `INVENTORY_LOGIN_LOCKOUT_SECONDS` (default 900).
+While locked, even correct credentials get
+`429 Account is temporarily locked.` with a `Retry-After` header and a
+`retry_after_seconds` field in the body. A successful login resets the
+counter.
+
 ## Product Object
 
 ```json
@@ -54,8 +89,26 @@ Field notes:
 
 ## GET /health
 
+Liveness probe. Always returns `200`.
+
 ```json
 { "status": "ok" }
+```
+
+## GET /ready
+
+Readiness probe. Returns `200 { "status": "ready" }` when the database is
+reachable, or `503 { "status": "not_ready", "error": "database_unreachable" }`
+otherwise. Use this for load-balancer readiness checks; use `/health` for
+liveness only.
+
+## GET /api/auth/csrf
+
+Issues (and stores in the session) a CSRF token. Mutating requests must echo
+this back in `X-CSRF-Token`.
+
+```json
+{ "csrf_token": "…" }
 ```
 
 ## POST /api/auth/register
@@ -242,6 +295,48 @@ Semantics:
 - A key **omitted** from the request leaves the stored value unchanged.
 - `low_stock_threshold: null` **clears** the override (the system default applies again).
 - `custom_fields: {}` clears all custom fields. Any value you send fully **replaces** the stored object.
+
+## GET /api/products/export
+
+Requires login. Streams every product owned by the calling user. Query
+parameter `format` is `json` (default) or `csv`. The response always
+includes `Content-Disposition: attachment; filename=products.{ext}`.
+
+CSV columns: `id, sku, name, stock_qty, status, low_stock_threshold,
+restock_threshold, custom_fields` (custom_fields is JSON-encoded).
+
+JSON response:
+
+```json
+{ "items": [ /* Product objects */ ] }
+```
+
+## GET /api/auth/audit
+
+Requires login. Returns the calling user's audit-log entries, most recent
+first.
+
+Query parameter: `limit` (default 50, max 500).
+
+```json
+{
+  "items": [
+    {
+      "id": 17,
+      "action": "product.delete",
+      "entity_type": "product",
+      "entity_id": 8,
+      "details": { "sku": "SMOKE-1", "name": "Smoke Test" },
+      "ip_address": "127.0.0.1",
+      "created_at": "2026-05-16T12:34:56"
+    }
+  ]
+}
+```
+
+Recorded actions: `auth.login`, `auth.login_failed`, `auth.logout`,
+`user.register`, `user.update_profile`, `user.change_password`,
+`product.create`, `product.update`, `product.delete`.
 
 ## DELETE /api/products/{id}
 

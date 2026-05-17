@@ -1,13 +1,31 @@
 from __future__ import annotations
 
+import csv
+import io
+import json
 import logging
 import os
+import secrets
 import sqlite3
+import time
+from collections import deque
 from datetime import timedelta
 from pathlib import Path
-from typing import Any, Dict, Optional
+from threading import Lock
+from typing import Any, Deque, Dict, Optional, Tuple
 
-from flask import Flask, current_app, g, jsonify, make_response, request, send_from_directory
+from flask import (
+    Flask,
+    Response,
+    current_app,
+    g,
+    jsonify,
+    make_response,
+    request,
+    send_from_directory,
+    session,
+    stream_with_context,
+)
 
 from auth import (
     current_user,
@@ -20,21 +38,7 @@ from auth import (
     verify_current_password,
     verify_password,
 )
-from crud import (
-    connect_db,
-    create_user,
-    delete_product,
-    get_product,
-    get_user_by_id,
-    get_user_by_username,
-    init_products_table,
-    init_users_table,
-    insert_product,
-    list_products,
-    update_product,
-    update_user_password,
-    update_user_username,
-)
+from crud import connect_db, init_audit_log_table, init_products_table, init_users_table
 from schemas import (
     ChangePasswordRequest,
     DeleteConfirmation,
@@ -44,11 +48,18 @@ from schemas import (
     RegisterRequest,
     UpdateProfileRequest,
 )
+from services import AccountLockedError, InventoryService
 
 
 BASE_DIR = Path(__file__).resolve().parent
-FRONTEND_DIR = BASE_DIR / "inventory-management-web"
+FRONTEND_SRC_DIR = BASE_DIR / "inventory-management-web"
+FRONTEND_DIST_DIR = FRONTEND_SRC_DIR / "dist"
 DEFAULT_DB_PATH = BASE_DIR / "inventory.db"
+
+CSRF_HEADER = "X-CSRF-Token"
+CSRF_SESSION_KEY = "csrf_token"
+CSRF_PROTECTED_METHODS = {"POST", "PUT", "DELETE", "PATCH"}
+CSRF_EXEMPT_PATHS = {"/api/auth/csrf"}
 
 
 class ApiError(Exception):
@@ -59,18 +70,32 @@ class ApiError(Exception):
 
 
 def load_env_file(env_path: Path) -> None:
+    """Load `.env` via python-dotenv if available, fall back to a minimal parser."""
     if not env_path.exists():
         return
-
-    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        os.environ.setdefault(key.strip(), value.strip())
+    try:
+        from dotenv import load_dotenv
+    except ImportError:
+        for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            os.environ.setdefault(key.strip(), value.strip())
+        return
+    load_dotenv(dotenv_path=env_path, override=False)
 
 
 load_env_file(BASE_DIR / ".env")
+
+
+def _resolve_frontend_dir() -> Path:
+    override = os.getenv("INVENTORY_FRONTEND_DIR")
+    if override:
+        return Path(override).resolve()
+    if FRONTEND_DIST_DIR.is_dir() and (FRONTEND_DIST_DIR / "index.html").exists():
+        return FRONTEND_DIST_DIR
+    return FRONTEND_SRC_DIR
 
 
 def create_app(test_config: Optional[Dict[str, Any]] = None) -> Flask:
@@ -84,16 +109,24 @@ def create_app(test_config: Optional[Dict[str, Any]] = None) -> Flask:
         LOG_LEVEL=os.getenv("INVENTORY_LOG_LEVEL", "INFO"),
         ADMIN_USERNAME=os.getenv("INVENTORY_ADMIN_USERNAME", "admin"),
         ADMIN_PASSWORD=os.getenv("INVENTORY_ADMIN_PASSWORD", "change-me-admin-password"),
-        FRONTEND_DIR=str(FRONTEND_DIR),
+        FRONTEND_DIR=str(_resolve_frontend_dir()),
         JSON_SORT_KEYS=False,
         PERMANENT_SESSION_LIFETIME=timedelta(days=30),
         SESSION_COOKIE_HTTPONLY=True,
         SESSION_COOKIE_SAMESITE="Lax",
         SESSION_COOKIE_SECURE=os.getenv("INVENTORY_SESSION_SECURE", "0") == "1",
         SESSION_COOKIE_NAME="inventory_session",
+        CSRF_ENABLED=os.getenv("INVENTORY_CSRF_ENABLED", "1") == "1",
+        RATE_LIMIT_ENABLED=os.getenv("INVENTORY_RATE_LIMIT_ENABLED", "1") == "1",
+        AUTH_RATE_LIMIT_MAX=int(os.getenv("INVENTORY_AUTH_RATE_LIMIT_MAX", "10")),
+        AUTH_RATE_LIMIT_WINDOW=int(os.getenv("INVENTORY_AUTH_RATE_LIMIT_WINDOW", "60")),
+        LOGIN_MAX_ATTEMPTS=int(os.getenv("INVENTORY_LOGIN_MAX_ATTEMPTS", "5")),
+        LOGIN_LOCKOUT_SECONDS=int(os.getenv("INVENTORY_LOGIN_LOCKOUT_SECONDS", "900")),
     )
     if test_config:
         app.config.update(test_config)
+
+    app.extensions["rate_limiter"] = RateLimiter()
 
     configure_logging(app)
     initialize_database(app)
@@ -118,6 +151,7 @@ def initialize_database(app: Flask) -> None:
     connection = connect_db(app.config["DB_PATH"])
     try:
         init_users_table(connection)
+        init_audit_log_table(connection)
         with app.app_context():
             admin_id = ensure_seed_admin(
                 connection,
@@ -129,6 +163,82 @@ def initialize_database(app: Flask) -> None:
         connection.close()
 
 
+# ---------------------------------------------------------------------------
+# Rate limiting (in-memory sliding window)
+# ---------------------------------------------------------------------------
+class RateLimiter:
+    def __init__(self) -> None:
+        self._buckets: Dict[str, Deque[float]] = {}
+        self._lock = Lock()
+
+    def hit(self, key: str, max_hits: int, window_seconds: int) -> bool:
+        """Return False when the caller has exceeded `max_hits` in `window_seconds`."""
+        now = time.monotonic()
+        cutoff = now - window_seconds
+        with self._lock:
+            bucket = self._buckets.setdefault(key, deque())
+            while bucket and bucket[0] < cutoff:
+                bucket.popleft()
+            if len(bucket) >= max_hits:
+                return False
+            bucket.append(now)
+            return True
+
+    def reset(self, key: str) -> None:
+        with self._lock:
+            self._buckets.pop(key, None)
+
+
+def _rate_limit_or_reject(bucket: str) -> None:
+    if not current_app.config.get("RATE_LIMIT_ENABLED", True):
+        return
+    limiter: RateLimiter = current_app.extensions["rate_limiter"]
+    max_hits = int(current_app.config.get("AUTH_RATE_LIMIT_MAX", 10))
+    window = int(current_app.config.get("AUTH_RATE_LIMIT_WINDOW", 60))
+    key = f"{bucket}:{_client_ip()}"
+    if not limiter.hit(key, max_hits, window):
+        raise ApiError(
+            "Too many requests. Try again in a moment.", 429
+        )
+
+
+def _client_ip() -> str:
+    forwarded = request.headers.get("X-Forwarded-For", "")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.remote_addr or "unknown"
+
+
+# ---------------------------------------------------------------------------
+# CSRF
+# ---------------------------------------------------------------------------
+def _issue_csrf_token() -> str:
+    token = session.get(CSRF_SESSION_KEY)
+    if not token:
+        token = secrets.token_urlsafe(32)
+        session[CSRF_SESSION_KEY] = token
+    return token
+
+
+def _check_csrf() -> None:
+    if not current_app.config.get("CSRF_ENABLED", True):
+        return
+    if request.method not in CSRF_PROTECTED_METHODS:
+        return
+    if not request.path.startswith("/api/"):
+        return
+    if request.path in CSRF_EXEMPT_PATHS:
+        return
+
+    expected = session.get(CSRF_SESSION_KEY)
+    provided = request.headers.get(CSRF_HEADER, "")
+    if not expected or not provided or not secrets.compare_digest(str(expected), provided):
+        raise ApiError("CSRF token missing or invalid.", 403)
+
+
+# ---------------------------------------------------------------------------
+# Lifecycle hooks + error handlers
+# ---------------------------------------------------------------------------
 def register_lifecycle_hooks(app: Flask) -> None:
     @app.before_request
     def before_request() -> Optional[Any]:
@@ -137,6 +247,8 @@ def register_lifecycle_hooks(app: Flask) -> None:
 
         if request.method == "OPTIONS" and request.path.startswith("/api/"):
             return make_response("", 204)
+
+        _check_csrf()
         return None
 
     @app.after_request
@@ -165,7 +277,7 @@ def register_lifecycle_hooks(app: Flask) -> None:
                 response.headers["Access-Control-Allow-Credentials"] = "true"
 
             response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
-            response.headers["Access-Control-Allow-Headers"] = "Content-Type"
+            response.headers["Access-Control-Allow-Headers"] = f"Content-Type, {CSRF_HEADER}"
 
         return response
 
@@ -180,6 +292,13 @@ def register_error_handlers(app: Flask) -> None:
     @app.errorhandler(ApiError)
     def handle_api_error(error: ApiError):
         return jsonify({"error": error.message}), error.status_code
+
+    @app.errorhandler(AccountLockedError)
+    def handle_account_locked(error: AccountLockedError):
+        response = jsonify({"error": str(error), "retry_after_seconds": error.retry_after_seconds})
+        response.status_code = 429
+        response.headers["Retry-After"] = str(error.retry_after_seconds)
+        return response
 
     @app.errorhandler(ValueError)
     def handle_value_error(error: ValueError):
@@ -203,33 +322,73 @@ def register_error_handlers(app: Flask) -> None:
         return jsonify({"error": "Unexpected server error."}), 500
 
 
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
 def register_routes(app: Flask) -> None:
     @app.route("/health", methods=["GET"])
     def health() -> Any:
         return jsonify({"status": "ok"})
 
+    @app.route("/ready", methods=["GET"])
+    def ready() -> Any:
+        try:
+            get_db().execute("SELECT 1").fetchone()
+        except sqlite3.Error as error:
+            current_app.logger.warning("Readiness check failed: %s", error)
+            return jsonify({"status": "not_ready", "error": "database_unreachable"}), 503
+        return jsonify({"status": "ready"})
+
+    @app.route("/api/auth/csrf", methods=["GET"])
+    def api_csrf() -> Any:
+        token = _issue_csrf_token()
+        return jsonify({"csrf_token": token})
+
     @app.route("/api/auth/register", methods=["POST"])
     def api_register() -> Any:
+        _rate_limit_or_reject("auth:register")
         payload = read_json_body()
         data = RegisterRequest.from_payload(payload)
-        if get_user_by_username(get_db(), data.username) is not None:
+        service = get_service()
+        if service.get_user_by_username(data.username) is not None:
             raise ApiError("Username already taken.", 409)
-        user = create_user(get_db(), data.username, hash_password(data.password))
+        user = service.create_user(data.username, hash_password(data.password))
         login_user(user.id, data.remember)
+        service.record_login(user.id)
+        _issue_csrf_token()
         return jsonify({"user": user.to_dict()}), 201
 
     @app.route("/api/auth/login", methods=["POST"])
     def api_login() -> Any:
+        _rate_limit_or_reject("auth:login")
         payload = read_json_body()
         credentials = LoginRequest.from_payload(payload)
-        record = get_user_by_username(get_db(), credentials.username)
+        service = get_service()
+
+        lock = service.check_account_lock(credentials.username)
+        if lock:
+            raise AccountLockedError(retry_after_seconds=lock["retry_after_seconds"])
+
+        record = service.get_user_by_username(credentials.username)
         if record is None or not verify_password(record["password_hash"], credentials.password):
+            if record is not None:
+                service.record_failed_login(record["id"])
             raise ApiError("Invalid username or password.", 401)
+
+        service.reset_failed_logins(record["id"])
         login_user(record["id"], credentials.remember)
+        service.record_login(record["id"])
+        _issue_csrf_token()
         return jsonify({"user": {"id": record["id"], "username": record["username"]}})
 
     @app.route("/api/auth/logout", methods=["POST"])
     def api_logout() -> Any:
+        user_id = current_user_id()
+        if user_id is not None:
+            try:
+                get_service().record_logout(user_id)
+            except sqlite3.Error:
+                pass
         logout_user()
         return jsonify({"message": "Logged out."})
 
@@ -246,18 +405,19 @@ def register_routes(app: Flask) -> None:
         payload = read_json_body()
         data = UpdateProfileRequest.from_payload(payload)
         user_id = require_user_id()
+        service = get_service()
 
         if not verify_current_password(get_db(), data.current_password):
             raise ApiError("Current password is incorrect.", 403)
 
-        existing = get_user_by_username(get_db(), data.username)
+        existing = service.get_user_by_username(data.username)
         if existing is not None and int(existing["id"]) != user_id:
             raise ApiError("Username already taken.", 409)
 
         if existing is not None and int(existing["id"]) == user_id:
-            user = get_user_by_id(get_db(), user_id)
+            user = service.get_user_by_id(user_id)
         else:
-            user = update_user_username(get_db(), user_id, data.username)
+            user = service.update_user_username(user_id, data.username)
 
         if user is None:
             raise LookupError("User not found.")
@@ -269,12 +429,21 @@ def register_routes(app: Flask) -> None:
         payload = read_json_body()
         data = ChangePasswordRequest.from_payload(payload)
         user_id = require_user_id()
+        service = get_service()
 
         if not verify_current_password(get_db(), data.current_password):
             raise ApiError("Current password is incorrect.", 403)
 
-        update_user_password(get_db(), user_id, hash_password(data.new_password))
+        service.update_user_password(user_id, hash_password(data.new_password))
         return jsonify({"message": "Password changed."})
+
+    @app.route("/api/auth/audit", methods=["GET"])
+    @login_required
+    def api_audit_log() -> Any:
+        user_id = require_user_id()
+        limit = parse_positive_int(request.args.get("limit", "50"), "limit")
+        events = get_service().list_audit_events(user_id, limit=limit)
+        return jsonify({"items": events})
 
     @app.route("/api/products", methods=["GET"])
     @login_required
@@ -282,8 +451,7 @@ def register_routes(app: Flask) -> None:
         search = request.args.get("search", "").strip()
         page = parse_positive_int(request.args.get("page", "1"), "page")
         limit = parse_positive_int(request.args.get("limit", "10"), "limit")
-        payload = list_products(
-            get_db(),
+        payload = get_service().list_products(
             user_id=require_user_id(),
             search=search,
             page=page,
@@ -291,10 +459,60 @@ def register_routes(app: Flask) -> None:
         )
         return jsonify(payload)
 
+    @app.route("/api/products/export", methods=["GET"])
+    @login_required
+    def api_export_products() -> Any:
+        fmt = (request.args.get("format") or "json").strip().lower()
+        if fmt not in ("json", "csv"):
+            raise ApiError("Format must be 'json' or 'csv'.", 400)
+        user_id = require_user_id()
+        if fmt == "json":
+            items = [product.to_dict() for product in get_service().iter_all_products(user_id)]
+            response = make_response(json.dumps({"items": items}, ensure_ascii=False))
+            response.mimetype = "application/json"
+            response.headers["Content-Disposition"] = "attachment; filename=products.json"
+            return response
+
+        @stream_with_context
+        def csv_rows():
+            buffer = io.StringIO()
+            writer = csv.writer(buffer)
+            writer.writerow([
+                "id",
+                "sku",
+                "name",
+                "stock_qty",
+                "status",
+                "low_stock_threshold",
+                "restock_threshold",
+                "custom_fields",
+            ])
+            yield buffer.getvalue()
+            buffer.seek(0)
+            buffer.truncate(0)
+            for product in get_service().iter_all_products(user_id):
+                writer.writerow([
+                    product.id,
+                    product.sku,
+                    product.name,
+                    product.stock_qty,
+                    product.status,
+                    "" if product.low_stock_threshold is None else product.low_stock_threshold,
+                    product.effective_threshold,
+                    json.dumps(product.custom_fields, ensure_ascii=False),
+                ])
+                yield buffer.getvalue()
+                buffer.seek(0)
+                buffer.truncate(0)
+
+        response = Response(csv_rows(), mimetype="text/csv")
+        response.headers["Content-Disposition"] = "attachment; filename=products.csv"
+        return response
+
     @app.route("/api/products/<int:product_id>", methods=["GET"])
     @login_required
     def api_get_product(product_id: int) -> Any:
-        product = get_product(get_db(), require_user_id(), product_id)
+        product = get_service().get_product(require_user_id(), product_id)
         if product is None:
             raise LookupError("Product not found.")
         return jsonify(product.to_dict())
@@ -303,8 +521,7 @@ def register_routes(app: Flask) -> None:
     @login_required
     def api_insert_product() -> Any:
         payload = read_json_body()
-        product = insert_product(
-            get_db(),
+        product = get_service().insert_product(
             require_user_id(),
             ProductCreate.from_payload(payload),
         )
@@ -314,8 +531,7 @@ def register_routes(app: Flask) -> None:
     @login_required
     def api_update_product(product_id: int) -> Any:
         payload = read_json_body()
-        product = update_product(
-            get_db(),
+        product = get_service().update_product(
             require_user_id(),
             product_id,
             ProductUpdate.from_payload(payload),
@@ -329,7 +545,7 @@ def register_routes(app: Flask) -> None:
         confirmation = DeleteConfirmation.from_payload(payload)
         if not verify_current_password(get_db(), confirmation.password):
             raise ApiError("Password does not match.", 403)
-        deleted = delete_product(get_db(), require_user_id(), product_id)
+        deleted = get_service().delete_product(require_user_id(), product_id)
         if not deleted:
             raise LookupError("Product not found.")
         return jsonify({"message": "Product deleted."})
@@ -360,6 +576,17 @@ def get_db() -> sqlite3.Connection:
     if "db" not in g:
         g.db = connect_db(current_app.config["DB_PATH"])
     return g.db
+
+
+def get_service() -> InventoryService:
+    if "service" not in g:
+        g.service = InventoryService(
+            get_db(),
+            request_ip=_client_ip() if request else None,
+            max_login_attempts=int(current_app.config.get("LOGIN_MAX_ATTEMPTS", 5)),
+            lockout_seconds=int(current_app.config.get("LOGIN_LOCKOUT_SECONDS", 900)),
+        )
+    return g.service
 
 
 def require_user_id() -> int:

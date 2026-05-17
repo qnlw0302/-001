@@ -3,8 +3,9 @@ from __future__ import annotations
 import json
 import math
 import sqlite3
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, Iterator, List, Optional, Union
 
 from schemas import (
     LOW_STOCK_THRESHOLD,
@@ -76,6 +77,37 @@ def init_users_table(connection: sqlite3.Connection) -> None:
         )
         """
     )
+
+    existing = _table_columns(connection, "users")
+    if "failed_login_count" not in existing:
+        connection.execute(
+            "ALTER TABLE users ADD COLUMN failed_login_count INTEGER NOT NULL DEFAULT 0"
+        )
+    if "locked_until" not in existing:
+        connection.execute("ALTER TABLE users ADD COLUMN locked_until TEXT")
+
+    connection.commit()
+
+
+def init_audit_log_table(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS audit_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+            action TEXT NOT NULL,
+            entity_type TEXT,
+            entity_id INTEGER,
+            details TEXT,
+            ip_address TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_audit_log_user "
+        "ON audit_log(user_id, created_at DESC)"
+    )
     connection.commit()
 
 
@@ -98,6 +130,8 @@ def init_products_table(
     connection.commit()
 
     if "user_id" in _table_columns(connection, "products"):
+        _ensure_product_indexes(connection)
+        connection.commit()
         return
 
     if default_owner_id is None:
@@ -106,6 +140,8 @@ def init_products_table(
             "Seed an admin user first."
         )
     _migrate_products_add_owner(connection, default_owner_id)
+    _ensure_product_indexes(connection)
+    connection.commit()
 
 
 def _create_products_table_v2(connection: sqlite3.Connection) -> None:
@@ -123,7 +159,19 @@ def _create_products_table_v2(connection: sqlite3.Connection) -> None:
         )
         """
     )
+    _ensure_product_indexes(connection)
     connection.commit()
+
+
+def _ensure_product_indexes(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_products_user_sku_lower "
+        "ON products(user_id, lower(sku))"
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_products_user_name_lower "
+        "ON products(user_id, lower(name))"
+    )
 
 
 def _migrate_products_add_owner(
@@ -234,6 +282,123 @@ def update_user_password(
         (new_password_hash, user_id),
     )
     connection.commit()
+
+
+def get_login_lock_state(
+    connection: sqlite3.Connection,
+    username: str,
+) -> Optional[Dict[str, Any]]:
+    row = connection.execute(
+        "SELECT id, failed_login_count, locked_until FROM users WHERE username = ?",
+        (username.strip(),),
+    ).fetchone()
+    if row is None:
+        return None
+    return {
+        "id": int(row["id"]),
+        "failed_login_count": int(row["failed_login_count"] or 0),
+        "locked_until": row["locked_until"],
+    }
+
+
+def record_failed_login(
+    connection: sqlite3.Connection,
+    user_id: int,
+    max_attempts: int,
+    lockout_seconds: int,
+) -> Dict[str, Any]:
+    row = connection.execute(
+        "SELECT failed_login_count FROM users WHERE id = ?",
+        (user_id,),
+    ).fetchone()
+    if row is None:
+        return {"failed_login_count": 0, "locked_until": None}
+
+    next_count = int(row["failed_login_count"] or 0) + 1
+    locked_until: Optional[str] = None
+    if next_count >= max_attempts:
+        locked_until = (
+            datetime.now(timezone.utc) + timedelta(seconds=lockout_seconds)
+        ).isoformat()
+
+    connection.execute(
+        "UPDATE users SET failed_login_count = ?, locked_until = ? WHERE id = ?",
+        (next_count, locked_until, user_id),
+    )
+    connection.commit()
+    return {"failed_login_count": next_count, "locked_until": locked_until}
+
+
+def reset_failed_logins(connection: sqlite3.Connection, user_id: int) -> None:
+    connection.execute(
+        "UPDATE users SET failed_login_count = 0, locked_until = NULL WHERE id = ?",
+        (user_id,),
+    )
+    connection.commit()
+
+
+def write_audit_event(
+    connection: sqlite3.Connection,
+    user_id: Optional[int],
+    action: str,
+    entity_type: Optional[str] = None,
+    entity_id: Optional[int] = None,
+    details: Optional[Dict[str, Any]] = None,
+    ip_address: Optional[str] = None,
+) -> None:
+    connection.execute(
+        """
+        INSERT INTO audit_log (user_id, action, entity_type, entity_id, details, ip_address)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            user_id,
+            action,
+            entity_type,
+            entity_id,
+            json.dumps(details) if details is not None else None,
+            ip_address,
+        ),
+    )
+    connection.commit()
+
+
+def list_audit_events(
+    connection: sqlite3.Connection,
+    user_id: int,
+    limit: int = 50,
+) -> List[Dict[str, Any]]:
+    rows = connection.execute(
+        """
+        SELECT id, action, entity_type, entity_id, details, ip_address, created_at
+        FROM audit_log
+        WHERE user_id = ?
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (user_id, max(1, min(500, int(limit)))),
+    ).fetchall()
+    events: List[Dict[str, Any]] = []
+    for row in rows:
+        raw_details = row["details"]
+        parsed_details: Any = None
+        if raw_details:
+            try:
+                parsed_details = json.loads(raw_details)
+            except json.JSONDecodeError:
+                parsed_details = raw_details
+        events.append(
+            {
+                "id": int(row["id"]),
+                "action": str(row["action"]),
+                "entity_type": row["entity_type"],
+                "entity_id": row["entity_id"],
+                "details": parsed_details,
+                "ip_address": row["ip_address"],
+                "created_at": row["created_at"],
+            }
+        )
+    return events
 
 
 def insert_product(
@@ -429,3 +594,15 @@ def list_products(
             "restock_threshold": LOW_STOCK_THRESHOLD,
         },
     }
+
+
+def iter_all_products(
+    connection: sqlite3.Connection,
+    user_id: int,
+) -> Iterator[Product]:
+    cursor = connection.execute(
+        f"SELECT {PRODUCT_COLUMNS} FROM products WHERE user_id = ? ORDER BY id ASC",
+        (user_id,),
+    )
+    for row in cursor:
+        yield _row_to_product(row)

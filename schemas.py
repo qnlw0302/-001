@@ -267,6 +267,51 @@ USERNAME_MAX_LENGTH = 64
 PASSWORD_MIN_LENGTH = 6
 PASSWORD_MAX_LENGTH = 128
 
+# Top common passwords (truncated). Reject these regardless of length to avoid
+# the most predictable choices. The list intentionally stays short — for a real
+# deployment, swap this for a zxcvbn-style strength estimator.
+COMMON_PASSWORDS = frozenset(
+    {
+        "password",
+        "password1",
+        "password123",
+        "passw0rd",
+        "p@ssw0rd",
+        "qwerty",
+        "qwerty123",
+        "111111",
+        "123123",
+        "123456",
+        "1234567",
+        "12345678",
+        "123456789",
+        "1234567890",
+        "abc123",
+        "abcd1234",
+        "iloveyou",
+        "letmein",
+        "welcome",
+        "welcome1",
+        "admin",
+        "admin1",
+        "admin123",
+        "administrator",
+        "root",
+        "toor",
+        "monkey",
+        "dragon",
+        "sunshine",
+        "princess",
+        "football",
+        "baseball",
+        "master",
+        "shadow",
+        "trustno1",
+        "changeme",
+        "default",
+    }
+)
+
 
 def _read_required_bool(payload: Mapping[str, Any], key: str) -> bool:
     value = payload.get(key, False)
@@ -309,6 +354,8 @@ def _read_new_password(
         raise ValueError(f"{label} must be at least {PASSWORD_MIN_LENGTH} characters.")
     if len(value) > PASSWORD_MAX_LENGTH:
         raise ValueError(f"{label} must be {PASSWORD_MAX_LENGTH} characters or fewer.")
+    if value.strip().lower() in COMMON_PASSWORDS:
+        raise ValueError(f"{label} is too common. Choose a less predictable one.")
     return value
 
 

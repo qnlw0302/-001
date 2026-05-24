@@ -238,28 +238,103 @@ class ProductCreate:
 class ProductUpdate:
     sku: Optional[str] = None
     name: Optional[str] = None
-    stock_qty: Optional[int] = None
     low_stock_threshold: Any = MISSING
     custom_fields: Any = MISSING
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, Any]) -> "ProductUpdate":
+        if "stock_qty" in payload:
+            raise ValueError(
+                "Stock quantity cannot be edited directly. "
+                "Use POST /api/products/<id>/movements to receive, remove, or adjust stock."
+            )
         update = cls(
             sku=_read_optional_text(payload, "sku", "SKU", 64),
             name=_read_optional_text(payload, "name", "Product name", 200),
-            stock_qty=_read_optional_int(payload, "stock_qty", "Stock quantity"),
             low_stock_threshold=_read_threshold_for_update(payload, "Low stock threshold"),
             custom_fields=_read_custom_fields_for_update(payload),
         )
         if (
             update.sku is None
             and update.name is None
-            and update.stock_qty is None
             and update.low_stock_threshold is MISSING
             and update.custom_fields is MISSING
         ):
             raise ValueError("At least one field is required for update.")
         return update
+
+
+# ---------------------------------------------------------------------------
+# Stock movements
+# ---------------------------------------------------------------------------
+
+MOVEMENT_TYPES = ("receive", "remove", "return", "damaged", "adjust")
+MOVEMENT_NOTE_MAX_LENGTH = 500
+
+
+@dataclass
+class StockMovement:
+    id: int
+    product_id: int
+    user_id: int
+    movement_type: str
+    quantity_delta: int
+    quantity_after: int
+    note: Optional[str]
+    created_at: str
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "product_id": self.product_id,
+            "movement_type": self.movement_type,
+            "quantity_delta": self.quantity_delta,
+            "quantity_after": self.quantity_after,
+            "note": self.note,
+            "created_at": self.created_at,
+        }
+
+
+@dataclass
+class MovementRequest:
+    """POST body for /api/products/<id>/movements.
+
+    For `receive`/`return`/`remove`/`damaged`: `quantity` is the magnitude moved
+    (must be ≥ 1). For `adjust`: `quantity` is the new absolute stock level
+    (must be ≥ 0); the service computes the delta against the current value.
+    """
+
+    movement_type: str
+    quantity: int
+    note: Optional[str] = None
+
+    @classmethod
+    def from_payload(cls, payload: Mapping[str, Any]) -> "MovementRequest":
+        raw_type = payload.get("type")
+        if raw_type is None:
+            raw_type = payload.get("movement_type")
+        if not isinstance(raw_type, str) or raw_type.strip() not in MOVEMENT_TYPES:
+            raise ValueError(
+                f"Movement type must be one of: {', '.join(MOVEMENT_TYPES)}."
+            )
+        movement_type = raw_type.strip()
+
+        if "quantity" not in payload:
+            raise ValueError("Quantity is required.")
+        try:
+            quantity = int(payload["quantity"])
+        except (TypeError, ValueError):
+            raise ValueError("Quantity must be an integer.") from None
+
+        if movement_type == "adjust":
+            if quantity < 0:
+                raise ValueError("Quantity must be 0 or greater for an adjustment.")
+        else:
+            if quantity <= 0:
+                raise ValueError("Quantity must be 1 or greater.")
+
+        note = _read_optional_text(payload, "note", "Note", MOVEMENT_NOTE_MAX_LENGTH)
+        return cls(movement_type=movement_type, quantity=quantity, note=note)
 
 
 USERNAME_MIN_LENGTH = 3

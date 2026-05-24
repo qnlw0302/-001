@@ -1,3 +1,5 @@
+import { t } from "./i18n.js";
+
 /**
  * Tiny inline-validation helper.
  *
@@ -63,25 +65,25 @@ export function createFieldValidator() {
 
 /* ---------- common validators ---------- */
 export const required = (label) => (value) => {
-  if (!value || !String(value).trim()) return `${label} is required.`;
+  if (!value || !String(value).trim()) return t("validation.required", { label });
   return null;
 };
 
 export const minLength = (label, n) => (value) => {
-  if (value && value.length < n) return `${label} must be at least ${n} characters.`;
+  if (value && value.length < n) return t("validation.minLength", { label, min: n });
   return null;
 };
 
 export const noWhitespace = (label) => (value) => {
-  if (value && /\s/.test(value)) return `${label} must not contain whitespace.`;
+  if (value && /\s/.test(value)) return t("validation.noWhitespace", { label });
   return null;
 };
 
 export const integerMin = (label, min) => (value) => {
   if (value === "" || value == null) return null;
   const n = Number(value);
-  if (!Number.isFinite(n) || !Number.isInteger(n)) return `${label} must be an integer.`;
-  if (n < min) return `${label} must be ${min} or greater.`;
+  if (!Number.isFinite(n) || !Number.isInteger(n)) return t("validation.integer", { label });
+  if (n < min) return t("validation.valueMin", { label, min });
   return null;
 };
 

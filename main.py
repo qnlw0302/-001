@@ -38,11 +38,18 @@ from auth import (
     verify_current_password,
     verify_password,
 )
-from crud import connect_db, init_audit_log_table, init_products_table, init_users_table
+from crud import (
+    connect_db,
+    init_audit_log_table,
+    init_products_table,
+    init_stock_movements_table,
+    init_users_table,
+)
 from schemas import (
     ChangePasswordRequest,
     DeleteConfirmation,
     LoginRequest,
+    MovementRequest,
     ProductCreate,
     ProductUpdate,
     RegisterRequest,
@@ -159,6 +166,7 @@ def initialize_database(app: Flask) -> None:
                 app.config["ADMIN_PASSWORD"],
             )
         init_products_table(connection, default_owner_id=admin_id)
+        init_stock_movements_table(connection)
     finally:
         connection.close()
 
@@ -399,6 +407,19 @@ def register_routes(app: Flask) -> None:
             return jsonify({"user": None}), 401
         return jsonify({"user": user.to_dict()})
 
+    @app.route("/api/auth/bootstrap", methods=["GET"])
+    def api_bootstrap() -> Any:
+        """First-paint endpoint: tells the SPA whether to show login, register, or
+        the inventory view. Combines the auth check with a user-existence probe so
+        a fresh desktop install (no users yet) can land on the register screen
+        instead of an empty login form."""
+        user = current_user(get_db())
+        has_users = get_service().count_users() > 0
+        return jsonify({
+            "user": user.to_dict() if user is not None else None,
+            "has_users": has_users,
+        })
+
     @app.route("/api/auth/me", methods=["PUT"])
     @login_required
     def api_update_me() -> Any:
@@ -549,6 +570,29 @@ def register_routes(app: Flask) -> None:
         if not deleted:
             raise LookupError("Product not found.")
         return jsonify({"message": "Product deleted."})
+
+    @app.route("/api/products/<int:product_id>/movements", methods=["POST"])
+    @login_required
+    def api_record_movement(product_id: int) -> Any:
+        payload = read_json_body()
+        data = MovementRequest.from_payload(payload)
+        movement, product = get_service().record_movement(
+            require_user_id(),
+            product_id,
+            data,
+        )
+        return jsonify({"movement": movement.to_dict(), "product": product.to_dict()}), 201
+
+    @app.route("/api/products/<int:product_id>/movements", methods=["GET"])
+    @login_required
+    def api_list_movements(product_id: int) -> Any:
+        limit = parse_positive_int(request.args.get("limit", "50"), "limit")
+        movements = get_service().list_movements(
+            require_user_id(),
+            product_id,
+            limit=limit,
+        )
+        return jsonify({"items": [m.to_dict() for m in movements]})
 
     @app.route("/", defaults={"path": ""})
     @app.route("/<path:path>")

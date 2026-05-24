@@ -28,6 +28,9 @@ inventory-management/
   .env.example
   README.md
   API_REFERENCE.md
+  docs/
+    USER_MANUAL_EN.md        # English user manual
+    USER_MANUAL_ZH.md        # Chinese user manual
   TODO.md                      # Roadmap split by Frontend / Backend / DB / Security / Deploy
   tests/
     test_api.py                # API tests driven by Flask test client
@@ -62,6 +65,13 @@ inventory-management/
     session cookie rides along, fetches a CSRF token on first mutation, and
     re-fetches automatically on session rotation.
   - In development, Vite proxies `/api` and `/health` to `http://127.0.0.1:5000`.
+  - Includes an English/Chinese language selector. The selected language is
+    remembered in browser local storage.
+
+## User Manuals
+
+- [English User Manual](docs/USER_MANUAL_EN.md)
+- [中文用户手册](docs/USER_MANUAL_ZH.md)
 
 ## Database Schema
 

@@ -13,6 +13,7 @@ from schemas import (
     Product,
     ProductCreate,
     ProductUpdate,
+    StockMovement,
     User,
 )
 
@@ -86,6 +87,33 @@ def init_users_table(connection: sqlite3.Connection) -> None:
     if "locked_until" not in existing:
         connection.execute("ALTER TABLE users ADD COLUMN locked_until TEXT")
 
+    connection.commit()
+
+
+def init_stock_movements_table(connection: sqlite3.Connection) -> None:
+    """Idempotent. Recorded for every receive/remove/return/damaged/adjust action."""
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS stock_movements (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            product_id INTEGER NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+            movement_type TEXT NOT NULL,
+            quantity_delta INTEGER NOT NULL,
+            quantity_after INTEGER NOT NULL,
+            note TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_stock_movements_product "
+        "ON stock_movements(product_id, id DESC)"
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_stock_movements_user "
+        "ON stock_movements(user_id, id DESC)"
+    )
     connection.commit()
 
 
@@ -240,6 +268,11 @@ def get_user_by_id(connection: sqlite3.Connection, user_id: int) -> Optional[Use
     if row is None:
         return None
     return _row_to_user(row)
+
+
+def count_users(connection: sqlite3.Connection) -> int:
+    row = connection.execute("SELECT COUNT(*) AS n FROM users").fetchone()
+    return int(row["n"]) if row else 0
 
 
 def get_password_hash(connection: sqlite3.Connection, user_id: int) -> Optional[str]:
@@ -464,7 +497,6 @@ def update_product(
 
     next_sku = data.sku if data.sku is not None else current.sku
     next_name = data.name if data.name is not None else current.name
-    next_stock = data.stock_qty if data.stock_qty is not None else current.stock_qty
 
     if data.low_stock_threshold is MISSING:
         next_threshold = current.low_stock_threshold
@@ -484,16 +516,17 @@ def update_product(
         if exists:
             raise ValueError("SKU already exists.")
 
+    # stock_qty is intentionally not in this UPDATE — it is mutated only via the
+    # stock_movements pipeline (services.record_movement → set_product_stock).
     connection.execute(
         """
         UPDATE products
-        SET sku = ?, name = ?, stock_qty = ?, low_stock_threshold = ?, custom_fields = ?
+        SET sku = ?, name = ?, low_stock_threshold = ?, custom_fields = ?
         WHERE id = ? AND user_id = ?
         """,
         (
             next_sku,
             next_name,
-            next_stock,
             next_threshold,
             json.dumps(next_custom),
             product_id,
@@ -519,6 +552,86 @@ def delete_product(
     )
     connection.commit()
     return cursor.rowcount > 0
+
+
+def set_product_stock(
+    connection: sqlite3.Connection,
+    user_id: int,
+    product_id: int,
+    new_stock_qty: int,
+) -> None:
+    """Stock-only writer used by the movements service. Does not touch other fields."""
+    if new_stock_qty < 0:
+        raise ValueError("Stock quantity cannot be negative.")
+    connection.execute(
+        "UPDATE products SET stock_qty = ? WHERE id = ? AND user_id = ?",
+        (int(new_stock_qty), product_id, user_id),
+    )
+    connection.commit()
+
+
+def insert_stock_movement(
+    connection: sqlite3.Connection,
+    user_id: int,
+    product_id: int,
+    movement_type: str,
+    quantity_delta: int,
+    quantity_after: int,
+    note: Optional[str] = None,
+) -> StockMovement:
+    cursor = connection.execute(
+        """
+        INSERT INTO stock_movements
+            (user_id, product_id, movement_type, quantity_delta, quantity_after, note)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (user_id, product_id, movement_type, int(quantity_delta), int(quantity_after), note),
+    )
+    connection.commit()
+    row = connection.execute(
+        """
+        SELECT id, user_id, product_id, movement_type, quantity_delta,
+               quantity_after, note, created_at
+        FROM stock_movements WHERE id = ?
+        """,
+        (cursor.lastrowid,),
+    ).fetchone()
+    if row is None:
+        raise RuntimeError("Stock movement could not be loaded after insert.")
+    return _row_to_stock_movement(row)
+
+
+def list_stock_movements(
+    connection: sqlite3.Connection,
+    user_id: int,
+    product_id: int,
+    limit: int = 50,
+) -> List[StockMovement]:
+    rows = connection.execute(
+        """
+        SELECT id, user_id, product_id, movement_type, quantity_delta,
+               quantity_after, note, created_at
+        FROM stock_movements
+        WHERE user_id = ? AND product_id = ?
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (user_id, product_id, max(1, min(500, int(limit)))),
+    ).fetchall()
+    return [_row_to_stock_movement(row) for row in rows]
+
+
+def _row_to_stock_movement(row: sqlite3.Row) -> StockMovement:
+    return StockMovement(
+        id=int(row["id"]),
+        product_id=int(row["product_id"]),
+        user_id=int(row["user_id"]),
+        movement_type=str(row["movement_type"]),
+        quantity_delta=int(row["quantity_delta"]),
+        quantity_after=int(row["quantity_after"]),
+        note=None if row["note"] is None else str(row["note"]),
+        created_at=str(row["created_at"]),
+    )
 
 
 def _build_where(conditions: List[str]) -> str:

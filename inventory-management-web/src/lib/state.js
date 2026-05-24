@@ -6,6 +6,7 @@ export const state = {
   limit: 10,
   totalPages: 1,
   pendingDelete: null,
+  pendingMovement: null,
   defaultThreshold: 5,
   customFieldRows: []
 };

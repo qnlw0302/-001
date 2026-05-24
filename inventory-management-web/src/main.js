@@ -1,5 +1,6 @@
 import { clearCsrfToken, request } from "./lib/api.js";
 import { showMessage } from "./lib/dom.js";
+import { applyLanguage, t } from "./lib/i18n.js";
 import { state } from "./lib/state.js";
 import { renderLoginView } from "./views/login.js";
 import { renderRegisterView } from "./views/register.js";
@@ -17,11 +18,12 @@ function showLogin() {
   });
 }
 
-function showRegister() {
+function showRegister(options = {}) {
   renderRegisterView({
     renderLoginView: showLogin,
     renderInventoryView,
-    loadProducts
+    loadProducts,
+    firstUser: !!options.firstUser
   });
 }
 
@@ -30,26 +32,31 @@ function goToLogin() {
   state.user = null;
   showLogin();
   const loginMessage = document.querySelector("#loginMessage");
-  if (loginMessage) showMessage(loginMessage, "Your session expired. Please log in again.", "error");
+  if (loginMessage) showMessage(loginMessage, t("auth.sessionExpired"), "error");
 }
 
 setGoToLogin(goToLogin);
 
 async function bootstrap() {
   try {
-    const payload = await request("/api/auth/me");
-    state.user = payload.user;
-    renderInventoryView();
-    await loadProducts(1);
-  } catch (error) {
-    if (error.status === 401) {
-      showLogin();
+    const payload = await request("/api/auth/bootstrap");
+    if (payload.user) {
+      state.user = payload.user;
+      renderInventoryView();
+      await loadProducts(1);
       return;
     }
+    if (payload.has_users === false) {
+      showRegister({ firstUser: true });
+      return;
+    }
+    showLogin();
+  } catch (error) {
     showLogin();
     const loginMessage = document.querySelector("#loginMessage");
     if (loginMessage) showMessage(loginMessage, error.message, "error");
   }
 }
 
+applyLanguage();
 bootstrap();

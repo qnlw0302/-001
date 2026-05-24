@@ -5,7 +5,15 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import crud
-from schemas import Product, ProductCreate, ProductUpdate, User
+from schemas import (
+    MOVEMENT_TYPES,
+    MovementRequest,
+    Product,
+    ProductCreate,
+    ProductUpdate,
+    StockMovement,
+    User,
+)
 
 
 class AccountLockedError(Exception):
@@ -58,6 +66,18 @@ class InventoryService:
             entity_id=product.id,
             details={"sku": product.sku, "name": product.name},
         )
+        # Seed a synthetic `receive` movement so the history isn't missing the
+        # initial stock — keeps `list_movements` a complete ledger from day one.
+        if product.stock_qty > 0:
+            crud.insert_stock_movement(
+                self._connection,
+                user_id=user_id,
+                product_id=product.id,
+                movement_type="receive",
+                quantity_delta=product.stock_qty,
+                quantity_after=product.stock_qty,
+                note="Initial stock on create",
+            )
         return product
 
     def update_product(
@@ -92,12 +112,88 @@ class InventoryService:
     def iter_all_products(self, user_id: int) -> Iterator[Product]:
         return crud.iter_all_products(self._connection, user_id)
 
+    # ---------- stock movements ----------
+    def record_movement(
+        self,
+        user_id: int,
+        product_id: int,
+        data: MovementRequest,
+    ) -> Tuple[StockMovement, Product]:
+        """Apply a stock movement and update the product's `stock_qty` atomically
+        from the caller's perspective. Owns the sign convention so callers always
+        send a positive magnitude (except for `adjust`, which is an absolute level).
+        """
+        product = crud.get_product(self._connection, user_id, product_id)
+        if product is None:
+            raise LookupError("Product not found.")
+
+        if data.movement_type == "adjust":
+            new_qty = data.quantity
+            delta = new_qty - product.stock_qty
+        elif data.movement_type in ("receive", "return"):
+            delta = data.quantity
+            new_qty = product.stock_qty + delta
+        elif data.movement_type in ("remove", "damaged"):
+            delta = -data.quantity
+            new_qty = product.stock_qty + delta
+            if new_qty < 0:
+                raise ValueError(
+                    f"Cannot {data.movement_type} {data.quantity} units: "
+                    f"only {product.stock_qty} in stock."
+                )
+        else:
+            # MovementRequest already validates against MOVEMENT_TYPES, so this
+            # branch is unreachable; keep it explicit so the type checker / a
+            # future contributor doesn't quietly fall through.
+            raise ValueError(f"Unsupported movement type: {data.movement_type}")
+
+        crud.set_product_stock(self._connection, user_id, product_id, new_qty)
+        movement = crud.insert_stock_movement(
+            self._connection,
+            user_id=user_id,
+            product_id=product_id,
+            movement_type=data.movement_type,
+            quantity_delta=delta,
+            quantity_after=new_qty,
+            note=data.note,
+        )
+        self._audit(
+            user_id,
+            f"stock.{data.movement_type}",
+            entity_type="product",
+            entity_id=product_id,
+            details={
+                "delta": delta,
+                "after": new_qty,
+                "sku": product.sku,
+                "note": data.note,
+            },
+        )
+        refreshed = crud.get_product(self._connection, user_id, product_id)
+        if refreshed is None:
+            raise RuntimeError("Product disappeared after stock movement.")
+        return movement, refreshed
+
+    def list_movements(
+        self,
+        user_id: int,
+        product_id: int,
+        limit: int = 50,
+    ) -> List[StockMovement]:
+        product = crud.get_product(self._connection, user_id, product_id)
+        if product is None:
+            raise LookupError("Product not found.")
+        return crud.list_stock_movements(self._connection, user_id, product_id, limit=limit)
+
     # ---------- users ----------
     def get_user_by_id(self, user_id: int) -> Optional[User]:
         return crud.get_user_by_id(self._connection, user_id)
 
     def get_user_by_username(self, username: str) -> Optional[Dict[str, Any]]:
         return crud.get_user_by_username(self._connection, username)
+
+    def count_users(self) -> int:
+        return crud.count_users(self._connection)
 
     def create_user(self, username: str, password_hash: str) -> User:
         user = crud.create_user(self._connection, username, password_hash)

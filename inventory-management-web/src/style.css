@@ -30,7 +30,8 @@ body {
 }
 
 button,
-input {
+input,
+select {
   font: inherit;
 }
 
@@ -178,6 +179,14 @@ input {
   border: 1px solid var(--line);
   border-radius: 12px;
   padding: 12px 14px;
+  background: #fff;
+  color: var(--text);
+}
+
+select {
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 10px 34px 10px 12px;
   background: #fff;
   color: var(--text);
 }
@@ -593,6 +602,28 @@ tbody tr:last-child td {
   flex-wrap: wrap;
 }
 
+.auth-language {
+  display: flex;
+  justify-content: flex-end;
+  margin-bottom: 18px;
+}
+
+.language-select {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 14px;
+}
+
+.language-select span {
+  white-space: nowrap;
+}
+
+.language-select select {
+  min-width: 112px;
+}
+
 .user-badge {
   color: var(--muted);
   font-size: 14px;
@@ -625,6 +656,10 @@ tbody tr:last-child td {
   box-shadow: var(--shadow);
 }
 
+.modal-card-wide {
+  max-width: 720px;
+}
+
 .modal-card h2 {
   margin: 0 0 6px;
   font-size: 22px;
@@ -634,6 +669,34 @@ tbody tr:last-child td {
 .modal-card p {
   margin: 0 0 16px;
   color: var(--muted);
+}
+
+.history-list {
+  max-height: 360px;
+  overflow: auto;
+  margin-bottom: 16px;
+  border: 1px solid var(--border, #e5e7eb);
+  border-radius: 12px;
+}
+
+.history-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 14px;
+}
+
+.history-table th,
+.history-table td {
+  text-align: left;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border, #e5e7eb);
+}
+
+.history-table th {
+  background: var(--surface-alt, #f7f7f9);
+  font-weight: 600;
+  position: sticky;
+  top: 0;
 }
 
 @media (max-width: 920px) {

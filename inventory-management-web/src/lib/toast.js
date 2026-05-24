@@ -1,18 +1,22 @@
 import { escapeHtml } from "./dom.js";
+import { t } from "./i18n.js";
 
 const TOAST_TIMEOUT_MS = 4500;
 let containerEl = null;
 let toastId = 0;
 
 function ensureContainer() {
-  if (containerEl && document.body.contains(containerEl)) return containerEl;
+  if (containerEl && document.body.contains(containerEl)) {
+    containerEl.setAttribute("aria-label", t("toast.notifications"));
+    return containerEl;
+  }
   containerEl = document.createElement("div");
   containerEl.className = "toast-stack";
   containerEl.setAttribute("role", "region");
-  containerEl.setAttribute("aria-label", "Notifications");
   containerEl.setAttribute("aria-live", "polite");
   containerEl.setAttribute("aria-atomic", "false");
   document.body.appendChild(containerEl);
+  containerEl.setAttribute("aria-label", t("toast.notifications"));
   return containerEl;
 }
 
@@ -36,7 +40,7 @@ export function showToast(message, type = "info", { timeout = TOAST_TIMEOUT_MS }
   toastEl.dataset.toastId = String(id);
   toastEl.innerHTML = `
     <span class="toast-message">${escapeHtml(message)}</span>
-    <button type="button" class="toast-close" aria-label="Dismiss notification">&times;</button>
+    <button type="button" class="toast-close" aria-label="${t("toast.dismiss")}">&times;</button>
   `;
   toastEl.querySelector(".toast-close").addEventListener("click", () => dismiss(toastEl));
   container.appendChild(toastEl);

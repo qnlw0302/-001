@@ -1,3 +1,5 @@
+import { t } from "./i18n.js";
+
 export const appRoot = document.querySelector("#app");
 
 export function escapeHtml(value) {
@@ -10,9 +12,9 @@ export function escapeHtml(value) {
 }
 
 export function statusLabel(status) {
-  if (status === "out") return "Out of Stock";
-  if (status === "low") return "Restock Soon";
-  return "OK";
+  if (status === "out") return t("status.out");
+  if (status === "low") return t("status.low");
+  return t("status.ok");
 }
 
 export function showMessage(element, text, type) {
@@ -33,11 +35,11 @@ export function togglePasswordVisibility(inputSelector, buttonSelector) {
   if (!input || !button) return;
   if (input.type === "password") {
     input.type = "text";
-    button.textContent = "Hide";
-    button.setAttribute("aria-label", "Hide password");
+    button.textContent = t("common.hide");
+    button.setAttribute("aria-label", t("common.hidePassword"));
   } else {
     input.type = "password";
-    button.textContent = "Show";
-    button.setAttribute("aria-label", "Show password");
+    button.textContent = t("common.show");
+    button.setAttribute("aria-label", t("common.showPassword"));
   }
 }

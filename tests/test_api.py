@@ -116,6 +116,44 @@ class InventoryApiTestCase(_ApiTestMixin, unittest.TestCase):
         self.assertEqual(response.status_code, 401)
         self.assertIsNone(response.get_json()["user"])
 
+    def test_bootstrap_anonymous_with_seeded_admin(self) -> None:
+        response = self.client.get("/api/auth/bootstrap")
+        self.assertEqual(response.status_code, 200)
+        body = response.get_json()
+        self.assertIsNone(body["user"])
+        self.assertTrue(body["has_users"])
+
+    def test_bootstrap_returns_logged_in_user(self) -> None:
+        self.login()
+        response = self.client.get("/api/auth/bootstrap")
+        self.assertEqual(response.status_code, 200)
+        body = response.get_json()
+        self.assertIsNotNone(body["user"])
+        self.assertEqual(body["user"]["username"], ADMIN_USERNAME)
+        self.assertTrue(body["has_users"])
+
+    def test_bootstrap_reports_no_users_on_fresh_install(self) -> None:
+        empty_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(empty_dir.cleanup)
+        fresh_app = create_app(
+            {
+                "TESTING": True,
+                "DB_PATH": str(Path(empty_dir.name) / "fresh.db"),
+                "SECRET_KEY": "fresh-secret",
+                "ADMIN_USERNAME": "",
+                "ADMIN_PASSWORD": "",
+                "FRONTEND_DIR": str(BASE_DIR / "inventory-management-web"),
+                "LOG_LEVEL": "CRITICAL",
+                "AUTH_RATE_LIMIT_MAX": 10_000,
+            }
+        )
+        client = CsrfTestClient(fresh_app)
+        response = client.get("/api/auth/bootstrap")
+        self.assertEqual(response.status_code, 200)
+        body = response.get_json()
+        self.assertIsNone(body["user"])
+        self.assertFalse(body["has_users"])
+
     def test_login_with_valid_credentials(self) -> None:
         response = self.login()
         self.assertEqual(response.status_code, 200)
@@ -183,13 +221,28 @@ class InventoryApiTestCase(_ApiTestMixin, unittest.TestCase):
 
         response = self.client.put(
             "/api/products/%s" % product_id,
-            json={"name": "Mechanical Keyboard", "stock_qty": 3},
+            json={"name": "Mechanical Keyboard", "low_stock_threshold": 10},
         )
 
         self.assertEqual(response.status_code, 200)
         payload = response.get_json()
         self.assertEqual(payload["name"], "Mechanical Keyboard")
+        # Stock didn't change (still 7), but the new threshold is 10, so it's low.
+        self.assertEqual(payload["stock_qty"], 7)
         self.assertEqual(payload["status"], "low")
+
+    def test_update_product_rejects_stock_qty(self) -> None:
+        """PUT no longer accepts stock_qty — stock changes must go through movements."""
+        self.login()
+        created = self.create_product("SKU-NOSTOCK", "Thing", 5)
+        product_id = created.get_json()["id"]
+
+        response = self.client.put(
+            "/api/products/%s" % product_id,
+            json={"stock_qty": 99},
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("movements", response.get_json()["error"])
 
     def test_delete_requires_login(self) -> None:
         response = self.client.delete("/api/products/1", json={"password": ADMIN_PASSWORD})
@@ -749,6 +802,177 @@ class ReadinessTestCase(_ApiTestMixin, unittest.TestCase):
         response = self.client.get("/ready")
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.get_json()["status"], "ready")
+
+
+class StockMovementTestCase(_ApiTestMixin, unittest.TestCase):
+    def _create(self, stock_qty: int = 10):
+        self.login()
+        created = self.create_product("SKU-MV", "Widget", stock_qty)
+        self.assertEqual(created.status_code, 201)
+        return created.get_json()["id"]
+
+    def _post_movement(self, product_id: int, payload: dict):
+        return self.client.post(
+            f"/api/products/{product_id}/movements",
+            json=payload,
+        )
+
+    def test_receive_adds_to_stock(self) -> None:
+        product_id = self._create(stock_qty=4)
+        response = self._post_movement(product_id, {"type": "receive", "quantity": 6})
+        self.assertEqual(response.status_code, 201)
+        body = response.get_json()
+        self.assertEqual(body["movement"]["movement_type"], "receive")
+        self.assertEqual(body["movement"]["quantity_delta"], 6)
+        self.assertEqual(body["movement"]["quantity_after"], 10)
+        self.assertEqual(body["product"]["stock_qty"], 10)
+
+    def test_return_adds_to_stock(self) -> None:
+        product_id = self._create(stock_qty=2)
+        response = self._post_movement(product_id, {"type": "return", "quantity": 3})
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.get_json()["product"]["stock_qty"], 5)
+
+    def test_remove_subtracts_from_stock(self) -> None:
+        product_id = self._create(stock_qty=8)
+        response = self._post_movement(product_id, {"type": "remove", "quantity": 3})
+        self.assertEqual(response.status_code, 201)
+        body = response.get_json()
+        self.assertEqual(body["movement"]["quantity_delta"], -3)
+        self.assertEqual(body["product"]["stock_qty"], 5)
+
+    def test_damaged_subtracts_from_stock(self) -> None:
+        product_id = self._create(stock_qty=5)
+        response = self._post_movement(product_id, {"type": "damaged", "quantity": 2})
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.get_json()["product"]["stock_qty"], 3)
+
+    def test_adjust_sets_absolute_quantity(self) -> None:
+        product_id = self._create(stock_qty=12)
+        response = self._post_movement(product_id, {"type": "adjust", "quantity": 7})
+        self.assertEqual(response.status_code, 201)
+        body = response.get_json()
+        self.assertEqual(body["movement"]["quantity_delta"], -5)
+        self.assertEqual(body["movement"]["quantity_after"], 7)
+        self.assertEqual(body["product"]["stock_qty"], 7)
+
+    def test_adjust_to_zero_is_allowed(self) -> None:
+        product_id = self._create(stock_qty=4)
+        response = self._post_movement(product_id, {"type": "adjust", "quantity": 0})
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.get_json()["product"]["stock_qty"], 0)
+        self.assertEqual(response.get_json()["product"]["status"], "out")
+
+    def test_remove_rejected_when_would_go_negative(self) -> None:
+        product_id = self._create(stock_qty=2)
+        response = self._post_movement(product_id, {"type": "remove", "quantity": 5})
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("in stock", response.get_json()["error"])
+
+    def test_damaged_rejected_when_would_go_negative(self) -> None:
+        product_id = self._create(stock_qty=1)
+        response = self._post_movement(product_id, {"type": "damaged", "quantity": 2})
+        self.assertEqual(response.status_code, 400)
+
+    def test_zero_or_negative_quantity_rejected(self) -> None:
+        product_id = self._create(stock_qty=5)
+        for qty in (0, -3):
+            response = self._post_movement(product_id, {"type": "receive", "quantity": qty})
+            self.assertEqual(response.status_code, 400, msg=f"qty={qty}")
+
+    def test_negative_adjust_rejected(self) -> None:
+        product_id = self._create()
+        response = self._post_movement(product_id, {"type": "adjust", "quantity": -1})
+        self.assertEqual(response.status_code, 400)
+
+    def test_unknown_movement_type_rejected(self) -> None:
+        product_id = self._create()
+        response = self._post_movement(product_id, {"type": "teleport", "quantity": 1})
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("Movement type", response.get_json()["error"])
+
+    def test_movement_optional_note_persisted(self) -> None:
+        product_id = self._create()
+        response = self._post_movement(
+            product_id, {"type": "receive", "quantity": 2, "note": "Truck arrival"}
+        )
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.get_json()["movement"]["note"], "Truck arrival")
+
+    def test_listing_returns_newest_first(self) -> None:
+        product_id = self._create(stock_qty=0)
+        self._post_movement(product_id, {"type": "receive", "quantity": 3})
+        self._post_movement(product_id, {"type": "remove", "quantity": 1})
+        self._post_movement(product_id, {"type": "adjust", "quantity": 9})
+
+        listing = self.client.get(f"/api/products/{product_id}/movements")
+        self.assertEqual(listing.status_code, 200)
+        items = listing.get_json()["items"]
+        self.assertEqual(len(items), 3)
+        self.assertEqual(items[0]["movement_type"], "adjust")
+        self.assertEqual(items[1]["movement_type"], "remove")
+        self.assertEqual(items[2]["movement_type"], "receive")
+
+    def test_initial_stock_recorded_as_receive_movement(self) -> None:
+        """Creating a product with stock_qty > 0 should leave a `receive` row in
+        history so the ledger is complete from day one."""
+        product_id = self._create(stock_qty=12)
+        listing = self.client.get(f"/api/products/{product_id}/movements")
+        items = listing.get_json()["items"]
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["movement_type"], "receive")
+        self.assertEqual(items[0]["quantity_delta"], 12)
+        self.assertEqual(items[0]["quantity_after"], 12)
+
+    def test_initial_stock_zero_creates_no_seed_movement(self) -> None:
+        self.login()
+        created = self.create_product("SKU-ZERO", "Empty", 0)
+        product_id = created.get_json()["id"]
+        listing = self.client.get(f"/api/products/{product_id}/movements")
+        self.assertEqual(listing.get_json()["items"], [])
+
+    def test_other_user_cannot_record_movement(self) -> None:
+        self.login()
+        owner_product = self.create_product("SHARED", "Mine", 5).get_json()["id"]
+        self.client.post("/api/auth/logout")
+
+        register = self.client.post(
+            "/api/auth/register",
+            json={"username": "intruder", "password": "intruder-pass-123", "remember": False},
+        )
+        self.assertEqual(register.status_code, 201)
+
+        response = self._post_movement(owner_product, {"type": "receive", "quantity": 1})
+        self.assertEqual(response.status_code, 404)
+
+    def test_other_user_cannot_list_movements(self) -> None:
+        self.login()
+        owner_product = self.create_product("HIDDEN", "Mine", 5).get_json()["id"]
+        self.client.post("/api/auth/logout")
+
+        register = self.client.post(
+            "/api/auth/register",
+            json={"username": "peeker", "password": "peeker-pass-123", "remember": False},
+        )
+        self.assertEqual(register.status_code, 201)
+
+        listing = self.client.get(f"/api/products/{owner_product}/movements")
+        self.assertEqual(listing.status_code, 404)
+
+    def test_movements_require_login(self) -> None:
+        # No login() here.
+        response = self.client.post(
+            "/api/products/1/movements",
+            json={"type": "receive", "quantity": 1},
+        )
+        self.assertEqual(response.status_code, 401)
+
+    def test_movement_writes_audit_entry(self) -> None:
+        product_id = self._create(stock_qty=5)
+        self._post_movement(product_id, {"type": "remove", "quantity": 2})
+        audit = self.client.get("/api/auth/audit?limit=50").get_json()["items"]
+        actions = [event["action"] for event in audit]
+        self.assertIn("stock.remove", actions)
 
 
 if __name__ == "__main__":

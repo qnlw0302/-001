@@ -1,8 +1,13 @@
 # OS
 .DS_Store
 
+# Local assistant/tool config
+.claude/
+CLAUDE.md
+
 # Python
 __pycache__/
+tests/__pycache__/
 *.pyc
 *.pyo
 *.egg-info/
@@ -17,6 +22,8 @@ htmlcov/
 # Node / frontend
 node_modules/
 dist/
+inventory-management-web/node_modules/
+inventory-management-web/dist/
 
 # Env (allow .env.example only)
 .env

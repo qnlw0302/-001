@@ -4,6 +4,7 @@ import { state } from "../lib/state.js";
 import { toast } from "../lib/toast.js";
 import { createFieldValidator, required } from "../lib/validation.js";
 import { withButtonLoading } from "../lib/focus-trap.js";
+import { bindLanguageSelect, renderLanguageSelect, t } from "../lib/i18n.js";
 
 export function renderLoginView({ renderRegisterView, renderInventoryView, loadProducts }) {
   const savedUsername = window.localStorage.getItem("inventoryUsername") || "";
@@ -12,25 +13,29 @@ export function renderLoginView({ renderRegisterView, renderInventoryView, loadP
   appRoot.innerHTML = `
     <main class="auth-page">
       <section class="auth-card">
+        <div class="auth-language">
+          ${renderLanguageSelect("loginLanguageSelect")}
+        </div>
+
         <header class="auth-heading">
-          <h1>Inventory Management</h1>
-          <p>Sign in to manage your inventory.</p>
+          <h1>${t("common.appName")}</h1>
+          <p>${t("auth.loginBody")}</p>
         </header>
 
         <div id="loginMessage" class="message" role="alert" aria-live="assertive"></div>
 
         <form id="loginForm" class="stack" autocomplete="on" novalidate>
           <div class="field">
-            <label for="loginUsername"><span>Username</span></label>
+            <label for="loginUsername"><span>${t("common.username")}</span></label>
             <input id="loginUsername" name="username" type="text" autocomplete="username" maxlength="64" required value="${escapeHtml(savedUsername)}" aria-describedby="loginUsernameError">
             <p id="loginUsernameError" class="field-error" hidden></p>
           </div>
 
           <div class="field">
-            <label for="loginPassword"><span>Password</span></label>
+            <label for="loginPassword"><span>${t("common.password")}</span></label>
             <div class="password-row">
               <input id="loginPassword" name="password" type="password" autocomplete="current-password" maxlength="128" required aria-describedby="loginPasswordError">
-              <button id="togglePasswordButton" class="button ghost" type="button" aria-label="Show password">Show</button>
+              <button id="togglePasswordButton" class="button ghost" type="button" aria-label="${t("common.showPassword")}">${t("common.show")}</button>
             </div>
             <p id="loginPasswordError" class="field-error" hidden></p>
           </div>
@@ -38,15 +43,15 @@ export function renderLoginView({ renderRegisterView, renderInventoryView, loadP
           <div class="auth-options">
             <label class="checkbox">
               <input id="rememberCheckbox" type="checkbox" ${savedRemember ? "checked" : ""}>
-              <span>Remember me</span>
+              <span>${t("auth.rememberMe")}</span>
             </label>
           </div>
 
           <div class="actions">
-            <button id="loginButton" class="button primary" type="submit">Log In</button>
+            <button id="loginButton" class="button primary" type="submit">${t("auth.login")}</button>
           </div>
 
-          <p class="auth-switch">No account yet? <button id="goRegisterButton" class="link-button" type="button">Create one</button></p>
+          <p class="auth-switch">${t("auth.noAccount")} <button id="goRegisterButton" class="link-button" type="button">${t("auth.createOne")}</button></p>
         </form>
       </section>
     </main>
@@ -56,14 +61,17 @@ export function renderLoginView({ renderRegisterView, renderInventoryView, loadP
   validator.attach({
     input: document.querySelector("#loginUsername"),
     error: document.querySelector("#loginUsernameError"),
-    validate: required("Username")
+    validate: required(t("common.username"))
   });
   validator.attach({
     input: document.querySelector("#loginPassword"),
     error: document.querySelector("#loginPasswordError"),
-    validate: required("Password")
+    validate: required(t("common.password"))
   });
 
+  bindLanguageSelect("#loginLanguageSelect", () =>
+    renderLoginView({ renderRegisterView, renderInventoryView, loadProducts })
+  );
   document.querySelector("#togglePasswordButton").addEventListener("click", () =>
     togglePasswordVisibility("#loginPassword", "#togglePasswordButton")
   );
@@ -97,8 +105,8 @@ async function handleLoginSubmit(event, validator, { renderInventoryView, loadPr
       persistRememberedUsername(username, remember);
       renderInventoryView();
       await loadProducts(1);
-      toast.success(`Welcome back, ${payload.user.username}.`);
-    }, "Signing in…");
+      toast.success(t("auth.welcomeBack", { username: payload.user.username }));
+    }, t("auth.signingIn"));
   } catch (error) {
     showMessage(loginMessage, error.message, "error");
   }

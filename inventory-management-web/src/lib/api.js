@@ -1,3 +1,5 @@
+import { t, translateError } from "./i18n.js";
+
 let csrfToken = null;
 let csrfPromise = null;
 
@@ -13,7 +15,7 @@ async function fetchCsrfToken() {
   if (csrfPromise) return csrfPromise;
   csrfPromise = fetch("/api/auth/csrf", { credentials: "include" })
     .then(async (response) => {
-      if (!response.ok) throw new Error("Could not establish session.");
+      if (!response.ok) throw new Error(t("api.csrfFailed"));
       const data = await response.json();
       csrfToken = data.csrf_token;
       return csrfToken;
@@ -45,7 +47,7 @@ async function doRequest(path, options, retried = false) {
       credentials: "include"
     });
   } catch (error) {
-    throw new Error("Unable to reach the server.");
+    throw new Error(t("api.networkError"));
   }
 
   const text = await response.text();
@@ -54,7 +56,7 @@ async function doRequest(path, options, retried = false) {
     try {
       data = JSON.parse(text);
     } catch (error) {
-      throw new Error("Server returned an invalid response.");
+      throw new Error(t("api.invalidResponse"));
     }
   }
 
@@ -64,7 +66,7 @@ async function doRequest(path, options, retried = false) {
       clearCsrfToken();
       return doRequest(path, options, true);
     }
-    const err = new Error((data && data.error) || "Request failed.");
+    const err = new Error(translateError((data && data.error) || t("api.requestFailed")));
     err.status = response.status;
     err.data = data;
     throw err;
